@@ -1,0 +1,89 @@
+name: Build & Release Windows EXE
+
+# Lives in the PUBLIC installers repo (free Actions). It checks out the PRIVATE
+# source repo via a read-only token, builds the unsigned NSIS installer on a free
+# windows-latest runner, and publishes the .exe to a Release on THIS public repo.
+# Source never lands here — only the finished .exe does.
+#
+# ONE-TIME SETUP (in this public repo's Settings > Secrets and variables > Actions):
+#   - Secret  PRIVATE_REPO_TOKEN : a fine-grained PAT with "Contents: Read-only"
+#                                   access to none298-dotcom/MyLinedChart.
+#
+# Then: Actions tab > "Build & Release Windows EXE" > Run workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Private-repo branch/tag/SHA to build from"
+        default: "main"
+        required: true
+      release_tag:
+        description: "Release tag to publish the .exe under"
+        default: "beta"
+        required: true
+
+permissions:
+  contents: write        # create/update the Release on this public repo
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout PRIVATE source repo
+        uses: actions/checkout@v4
+        with:
+          repository: none298-dotcom/MyLinedChart
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: windows-app/package-lock.json
+
+      - name: Install dependencies
+        working-directory: windows-app
+        run: npm ci
+
+      - name: Build NSIS installer (.exe)
+        working-directory: windows-app
+        # predist:win extracts the bundled connector, then electron-builder makes the x64 NSIS installer
+        run: npm run dist:win
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"   # force unsigned; never hunt for a cert in CI
+
+      - name: Rename installer to a stable name
+        id: pkg
+        shell: bash
+        run: |
+          src="$(ls windows-app/dist/*.exe | head -1)"
+          out="windows-app/dist/MyLinedChart-Windows-Setup.exe"
+          [ "$src" = "$out" ] || mv "$src" "$out"
+          echo "exe=$out" >> "$GITHUB_OUTPUT"
+          echo "Built: $out"
+
+      - name: Upload as run artifact (fallback / debugging)
+        uses: actions/upload-artifact@v4
+        with:
+          name: MyLinedChart-Windows-Setup
+          path: ${{ steps.pkg.outputs.exe }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish to public Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ inputs.release_tag }}"
+          exe="${{ steps.pkg.outputs.exe }}"
+          # create the release if the tag doesn't exist yet, else just (re)upload the asset
+          gh release create "$tag" "$exe" \
+            --repo "${{ github.repository }}" \
+            --title "MyLinedChart Windows (beta)" \
+            --notes "Unsigned beta installer. On first launch Windows SmartScreen will warn — click **More info → Run anyway**." \
+            || gh release upload "$tag" "$exe" --clobber --repo "${{ github.repository }}"
+          echo "Published $exe to release '$tag'"
