@@ -1,0 +1,131 @@
+name: Build & Release macOS DMG
+
+# Lives in the PUBLIC installers repo (free Actions, including free macOS
+# runners). Mirrors the Windows workflow: checks out the PRIVATE source via a
+# read-only token, imports the owner's Apple Development signing cert from
+# secrets into an ephemeral keychain, builds + signs MyLinedChart.app and the
+# IBKR Connector.app on a free macos-latest runner, packages a DMG, and
+# publishes it to a Release on THIS public repo. Source never lands here — only
+# the finished .dmg does.
+#
+# ONE-TIME SETUP (this repo's Settings > Secrets and variables > Actions):
+#   PRIVATE_REPO_TOKEN    : fine-grained PAT, Contents:Read on none298-dotcom/MyLinedChart
+#                           (ALREADY set — the Windows workflow uses the same one)
+#   MAC_CERT_P12_BASE64   : your Apple Development cert exported as a .p12, base64-encoded.
+#                           Keychain Access > right-click the "Apple Development: ..." cert >
+#                           Export > save as .p12 (set a password) > then in Terminal:
+#                             base64 -i cert.p12 | pbcopy   (paste as the secret value)
+#   MAC_CERT_PASSWORD     : the password you set when exporting the .p12
+#   MAC_CODESIGN_IDENTITY : the exact identity string, e.g.
+#                             "Apple Development: Your Name (TEAMID)"
+#                           find it with:  security find-identity -v -p codesigning
+#
+# NOTE: this is a BETA build — Apple Development signed, NOT notarized (same tier
+# as the existing beta DMG). On first launch macOS Gatekeeper warns; right-click
+# > Open, or System Settings > Privacy & Security > Open Anyway. A clean,
+# no-warning release needs a Developer ID cert + notarization (scripts/release-macos.sh).
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Private-repo branch/tag/SHA to build from"
+        default: "main"
+        required: true
+      release_tag:
+        description: "Release tag to publish the .dmg under"
+        default: "beta"
+        required: true
+
+permissions:
+  contents: write        # create/update the Release on this public repo
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout PRIVATE source repo
+        uses: actions/checkout@v4
+        with:
+          repository: none298-dotcom/MyLinedChart
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+
+      - name: Import Apple Development signing cert into an ephemeral keychain
+        env:
+          MAC_CERT_P12_BASE64: ${{ secrets.MAC_CERT_P12_BASE64 }}
+          MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MAC_CERT_P12_BASE64:-}" ]; then
+            echo "ERROR: MAC_CERT_P12_BASE64 secret is not set — see the setup notes at the top of this workflow." >&2
+            exit 1
+          fi
+          CERT_PATH="$RUNNER_TEMP/mlc-cert.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/mlc-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
+          echo "$MAC_CERT_P12_BASE64" | base64 --decode > "$CERT_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$MAC_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" >/dev/null
+          # Put our keychain first in the user search list so codesign / find-identity see the cert.
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | sed s/\"//g)
+          rm -f "$CERT_PATH"
+          echo "Available signing identities:"
+          security find-identity -v -p codesigning
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      - name: Build + sign MyLinedChart.app
+        env:
+          MYLINEDCHART_CODESIGN_IDENTITY: ${{ secrets.MAC_CODESIGN_IDENTITY }}
+          MYLINEDCHART_ENTITLEMENTS_FILE: mac-app-src/MyLinedChart.release.entitlements
+        run: ./build-native-app.sh
+
+      - name: Build + sign the IBKR Connector.app
+        env:
+          MYLINEDCHART_CODESIGN_IDENTITY: ${{ secrets.MAC_CODESIGN_IDENTITY }}
+          MYLINEDCHART_ENTITLEMENTS_FILE: ibkr-connector-app-src/Connector.release.entitlements
+        run: ./build-ibkr-connector-app.sh
+
+      - name: Package DMG (app + connector + /Applications symlink)
+        id: pkg
+        run: |
+          set -euo pipefail
+          STAGING="$RUNNER_TEMP/dmg-staging"
+          rm -rf "$STAGING"; mkdir -p "$STAGING"
+          ditto "MyLinedChart.app" "$STAGING/MyLinedChart.app"
+          ditto "MyLinedChart IBKR Connector.app" "$STAGING/MyLinedChart IBKR Connector.app"
+          ln -s /Applications "$STAGING/Applications"
+          out="$PWD/MyLinedChart-macOS.dmg"
+          rm -f "$out"
+          hdiutil create -volname "MyLinedChart" -srcfolder "$STAGING" -ov -format UDZO -imagekey zlib-level=9 "$out"
+          echo "dmg=$out" >> "$GITHUB_OUTPUT"
+          echo "Built: $out"
+
+      - name: Upload as run artifact (fallback / debugging)
+        uses: actions/upload-artifact@v4
+        with:
+          name: MyLinedChart-macOS
+          path: ${{ steps.pkg.outputs.dmg }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish to public Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.release_tag }}"
+          dmg="${{ steps.pkg.outputs.dmg }}"
+          # create the release if the tag doesn't exist yet, else just (re)upload the asset
+          gh release create "$tag" "$dmg" \
+            --repo "${{ github.repository }}" \
+            --title "MyLinedChart (beta)" \
+            --notes "Unsigned-for-notarization beta installers. macOS: right-click > Open (or System Settings > Privacy & Security > Open Anyway). Windows: More info > Run anyway." \
+            || gh release upload "$tag" "$dmg" --clobber --repo "${{ github.repository }}"
+          echo "Published $dmg to release '$tag'"
