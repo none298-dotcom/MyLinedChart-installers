@@ -22,6 +22,10 @@ on:
         description: "Release tag to publish the .exe under"
         default: "beta"
         required: true
+      build_epoch:
+        description: "Unix epoch to stamp into build-info.json (must match latest.json). 0 = use now."
+        default: "0"
+        required: true
 
 permissions:
   contents: write        # create/update the Release on this public repo
