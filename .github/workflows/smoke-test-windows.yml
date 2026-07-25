@@ -1,0 +1,102 @@
+name: Smoke test Windows app
+
+# Windows has been the ONLY platform never actually executed — every Windows fix
+# shipped on a code read alone, and two real bugs (a permanently dead in-chart
+# Sign In button, and an auth indicator that never updated) survived review
+# precisely because nothing ever ran. macOS/iOS/Android can all be run on the dev
+# Mac; Windows cannot. A free windows-latest runner can.
+#
+# This launches the real Electron app on Windows, lets it boot the bundled chart,
+# and asserts on the app's own stdout that it got through startup. It does NOT
+# need a signed installer — it runs from source, so it can gate a branch before
+# anything is published.
+#
+# Deliberately narrow: it proves "the app starts and the chart bootstraps on
+# Windows without crashing". It cannot prove provider fetches (no API keys here).
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Private-repo branch/tag/SHA to smoke test"
+        default: "main"
+        required: true
+
+jobs:
+  smoke:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout PRIVATE source repo
+        uses: actions/checkout@v4
+        with:
+          repository: none298-dotcom/MyLinedChart
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        working-directory: windows-app
+        run: npm ci
+
+      # Syntax gate first: a parse error would otherwise show up as a confusing
+      # "app exited immediately" below.
+      - name: Syntax check
+        working-directory: windows-app
+        run: node --check main.js
+
+      # The GitHub windows-latest image has an interactive desktop session, so
+      # Electron can create its BrowserWindow. Run it detached, give the chart
+      # time to load + bootstrap, then stop it and inspect what it logged.
+      - name: Launch the app and capture its output
+        working-directory: windows-app
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $out = Join-Path $PWD 'smoke-stdout.log'
+          $err = Join-Path $PWD 'smoke-stderr.log'
+          $electron = Join-Path $PWD 'node_modules\electron\dist\electron.exe'
+          if (!(Test-Path $electron)) { throw "electron binary not found at $electron" }
+          $p = Start-Process -FilePath $electron -ArgumentList '.' `
+                 -RedirectStandardOutput $out -RedirectStandardError $err -PassThru
+          Start-Sleep -Seconds 45
+          if ($p.HasExited) {
+            Write-Host "::error::App exited on its own with code $($p.ExitCode) — it should still be running."
+          } else {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          }
+          Write-Host "----- stdout -----"; if (Test-Path $out) { Get-Content $out }
+          Write-Host "----- stderr -----"; if (Test-Path $err) { Get-Content $err }
+
+      - name: Assert the chart actually bootstrapped
+        working-directory: windows-app
+        shell: pwsh
+        run: |
+          $out = if (Test-Path 'smoke-stdout.log') { Get-Content 'smoke-stdout.log' -Raw } else { '' }
+          $err = if (Test-Path 'smoke-stderr.log') { Get-Content 'smoke-stderr.log' -Raw } else { '' }
+          $all = "$out`n$err"
+          # main.js logs this once its ready-probe succeeds and it pushes the
+          # bootstrap config -- i.e. the bundled chart's JS is alive.
+          if ($all -notmatch 'appPostMessage reroute') {
+            Write-Host "::error::Chart never reached the ready probe (no 'appPostMessage reroute' in output)."
+            exit 1
+          }
+          # Any unhandled crash surfaces here.
+          if ($all -match 'Uncaught Exception|UnhandledPromiseRejection|A JavaScript error occurred') {
+            Write-Host "::error::App logged an unhandled error during startup."
+            exit 1
+          }
+          Write-Host "Windows smoke test passed: app launched and the chart bootstrapped."
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-smoke-logs
+          path: |
+            windows-app/smoke-stdout.log
+            windows-app/smoke-stderr.log
+          if-no-files-found: warn
