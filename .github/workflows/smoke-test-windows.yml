@@ -48,6 +48,15 @@ jobs:
         working-directory: windows-app
         run: node --check main.js
 
+      # Business-rule guard: a LAPSED MyLinedChart subscription must still be
+      # cut back to demo even when the user's own broker API key keeps working.
+      # Tests the real computeDemoGateState out of the shared chart bundle, so it
+      # guards all five platforms, not just Windows.
+      - name: Entitlement gate truth table
+        working-directory: windows-app
+        timeout-minutes: 3
+        run: node scripts/smoke-demo-gate.js
+
       # Functional half: does the FILE PIPELINE actually work on Windows?
       # Runs the real shipped import functions against NTFS rename semantics,
       # CRLF CSV and a .xlsx read off disk. timeout-minutes is a hard guard --
