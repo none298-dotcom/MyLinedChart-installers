@@ -81,6 +81,25 @@ jobs:
           $p = Start-Process -FilePath $electron -ArgumentList '.' `
                  -RedirectStandardOutput $out -RedirectStandardError $err -PassThru
           Start-Sleep -Seconds 45
+          # ★ SCREENSHOT THE APP BEFORE KILLING IT.
+          # Windows is the only platform nobody has ever LOOKED at — every UI
+          # claim about it has been inference from stdout. The runner already
+          # launches the real app on a real desktop session, so it can also show
+          # us what that app looks like. Captured while the process is still
+          # alive, then uploaded as an artifact.
+          try {
+            Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+            $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $bmp = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+            $gfx = [System.Drawing.Graphics]::FromImage($bmp)
+            $gfx.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+            $shot = Join-Path $PWD 'windows-app-screenshot.png'
+            $bmp.Save($shot, [System.Drawing.Imaging.ImageFormat]::Png)
+            $gfx.Dispose(); $bmp.Dispose()
+            Write-Host "screenshot saved: $shot ($($bounds.Width)x$($bounds.Height))"
+          } catch {
+            Write-Host "::warning::screenshot capture failed: $($_.Exception.Message)"
+          }
           if ($p.HasExited) {
             Write-Host "::error::App exited on its own with code $($p.ExitCode) — it should still be running."
           } else {
@@ -117,4 +136,5 @@ jobs:
           path: |
             windows-app/smoke-stdout.log
             windows-app/smoke-stderr.log
+            windows-app/windows-app-screenshot.png
           if-no-files-found: warn
