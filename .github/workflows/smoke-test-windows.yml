@@ -48,6 +48,15 @@ jobs:
         working-directory: windows-app
         run: node --check main.js
 
+      # Functional half: does the FILE PIPELINE actually work on Windows?
+      # Runs the real shipped import functions against NTFS rename semantics,
+      # CRLF CSV and a .xlsx read off disk. timeout-minutes is a hard guard --
+      # a sandbox that spins must fail the run, not burn the runner.
+      - name: Import pipeline functional test
+        working-directory: windows-app
+        timeout-minutes: 5
+        run: node scripts/smoke-export-import.js
+
       # The GitHub windows-latest image has an interactive desktop session, so
       # Electron can create its BrowserWindow. Run it detached, give the chart
       # time to load + bootstrap, then stop it and inspect what it logged.
