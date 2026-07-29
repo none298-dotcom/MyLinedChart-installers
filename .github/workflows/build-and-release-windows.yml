@@ -34,6 +34,13 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    # `secrets` is NOT a valid context in a step-level `if:` (GitHub rejects the
+    # whole workflow with "Unrecognized named-value: 'secrets'"). Surfacing it as
+    # a job env var is the supported way to let a step ask "is signing configured
+    # here?" — which keeps the build working in a fork that has no Azure access.
+    env:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
     steps:
       - name: Checkout PRIVATE source repo
         uses: actions/checkout@v4
@@ -91,11 +98,11 @@ jobs:
       # credential-less run still produces the unsigned installer it used to.
       - name: Sign installer (Azure Trusted Signing)
         id: sign
-        if: ${{ secrets.AZURE_CLIENT_ID != '' }}
+        if: ${{ env.AZURE_CLIENT_ID != '' }}
         uses: azure/trusted-signing-action@v0
         with:
-          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-tenant-id: ${{ env.AZURE_TENANT_ID }}
+          azure-client-id: ${{ env.AZURE_CLIENT_ID }}
           endpoint: https://eus.codesigning.azure.net/
           trusted-signing-account-name: mlcsigning
           certificate-profile-name: mlc-public-trust
