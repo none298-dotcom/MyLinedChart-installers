@@ -29,6 +29,7 @@ on:
 
 permissions:
   contents: write        # create/update the Release on this public repo
+  id-token: write        # OIDC token for Azure Trusted Signing (no stored secret)
 
 jobs:
   build:
@@ -65,7 +66,10 @@ jobs:
         # predist:win extracts the bundled connector, then electron-builder makes the x64 NSIS installer
         run: npm run dist:win
         env:
-          CSC_IDENTITY_AUTO_DISCOVERY: "false"   # force unsigned; never hunt for a cert in CI
+          # electron-builder still packages UNSIGNED and never hunts for a cert;
+          # the Trusted Signing step below signs the finished .exe. Keeping the
+          # two separate means a signing failure cannot corrupt the package.
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
 
       - name: Rename installer to a stable name
         id: pkg
@@ -76,6 +80,40 @@ jobs:
           [ "$src" = "$out" ] || mv "$src" "$out"
           echo "exe=$out" >> "$GITHUB_OUTPUT"
           echo "Built: $out"
+
+      # ★ Authenticode-sign with Azure Trusted Signing.
+      # Signs with the SHORT-LIVED cert Azure mints per run under the
+      # mlc-public-trust profile -- nothing to install, renew or store here.
+      # Auth is OIDC/federated: the runner exchanges a GitHub token for an Azure
+      # one, so this PUBLIC repo holds NO long-lived credential. The three
+      # AZURE_* secrets are identifiers, not passwords.
+      # Skips cleanly if the secrets are absent, so a fork or a
+      # credential-less run still produces the unsigned installer it used to.
+      - name: Sign installer (Azure Trusted Signing)
+        id: sign
+        if: ${{ secrets.AZURE_CLIENT_ID != '' }}
+        uses: azure/trusted-signing-action@v0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          endpoint: https://eus.codesigning.azure.net/
+          trusted-signing-account-name: mlcsigning
+          certificate-profile-name: mlc-public-trust
+          files: ${{ steps.pkg.outputs.exe }}
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Verify the signature landed
+        shell: pwsh
+        run: |
+          $exe = "${{ steps.pkg.outputs.exe }}"
+          $sig = Get-AuthenticodeSignature $exe
+          Write-Host "Status : $($sig.Status)"
+          Write-Host "Signer : $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') {
+            Write-Host "::warning::Installer is NOT validly signed ($($sig.Status)) - it will trigger SmartScreen."
+          }
 
       - name: Upload as run artifact (fallback / debugging)
         uses: actions/upload-artifact@v4
@@ -96,6 +134,6 @@ jobs:
           gh release create "$tag" "$exe" \
             --repo "${{ github.repository }}" \
             --title "MyLinedChart Windows (beta)" \
-            --notes "Unsigned beta installer. On first launch Windows SmartScreen will warn — click **More info → Run anyway**." \
+            --notes "Beta installer, Authenticode-signed by Little Bird Trading LLC via Azure Trusted Signing." \
             || gh release upload "$tag" "$exe" --clobber --repo "${{ github.repository }}"
           echo "Published $exe to release '$tag'"
