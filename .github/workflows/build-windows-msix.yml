@@ -1,0 +1,97 @@
+name: Build Windows MSIX (Microsoft Store)
+
+# Builds the MSIX package for the Microsoft Store, as opposed to
+# build-and-release-windows.yml which builds the direct-download NSIS .exe.
+#
+# TWO DIFFERENCES FROM THE EXE BUILD, both deliberate:
+#   1. Uses windows-app/electron-builder.store.yml, which does NOT bundle the
+#      Connector — MSIX network isolation blocks loopback to it, so the Store
+#      edition declares connectorAvailable=false and could never call it.
+#   2. NO signing step. Microsoft signs Store packages itself; that is the whole
+#      reason MSIX avoids the Azure Trusted Signing dance the .exe needs.
+#
+# The result is uploaded as a run artifact rather than a Release: an MSIX is
+# submitted by uploading the file directly in Partner Center, so it needs no
+# public URL (unlike the .exe, which needs a direct non-redirecting one).
+#
+# ⚠ NOT SUBMITTABLE until the MSIX product exists in Partner Center and its
+# assigned identityName / publisher replace the placeholders in
+# electron-builder.store.yml. The package will still BUILD without them, which
+# is what makes this workflow useful now.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Private-repo branch/tag/SHA to build from"
+        default: "main"
+        required: true
+      build_epoch:
+        description: "Build epoch for the in-app update check (0 = now)"
+        default: "0"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout PRIVATE source repo
+        uses: actions/checkout@v4
+        with:
+          repository: none298-dotcom/MyLinedChart
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: windows-app/package-lock.json
+
+      - name: Install dependencies
+        working-directory: windows-app
+        run: npm ci
+
+      - name: Stamp build-info.json (in-app update checker epoch)
+        shell: bash
+        run: |
+          ep="${{ inputs.build_epoch }}"
+          if [ "$ep" = "0" ] || [ -z "$ep" ]; then ep="$(date +%s)"; fi
+          printf '{ "buildEpoch": %s }\n' "$ep" > windows-app/build-info.json
+          cat windows-app/build-info.json
+
+      - name: Build MSIX (appx target)
+        working-directory: windows-app
+        run: npm run dist:win:store
+
+      - name: Report what was produced
+        shell: pwsh
+        run: |
+          $pkgs = Get-ChildItem windows-app/dist-store -Include *.appx,*.msix -Recurse -ErrorAction SilentlyContinue
+          if (-not $pkgs) {
+            Write-Host "::error::No .appx/.msix produced."
+            Get-ChildItem windows-app/dist-store -Recurse -ErrorAction SilentlyContinue | Select-Object -First 40 | Format-Table Name,Length
+            exit 1
+          }
+          foreach ($p in $pkgs) {
+            Write-Host ("{0}  {1:N0} bytes ({2:N1} MB)" -f $p.Name, $p.Length, ($p.Length/1MB))
+          }
+          # Sanity-check the size difference the store config is supposed to make:
+          # without the bundled Connector this should be MUCH smaller than the
+          # ~103MB NSIS installer.
+          $mb = ($pkgs | Measure-Object -Property Length -Sum).Sum / 1MB
+          Write-Host ("Total package size: {0:N1} MB" -f $mb)
+
+      - name: Upload MSIX artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MyLinedChart-MSIX
+          path: |
+            windows-app/dist-store/*.appx
+            windows-app/dist-store/*.msix
+          if-no-files-found: error
+          retention-days: 30
