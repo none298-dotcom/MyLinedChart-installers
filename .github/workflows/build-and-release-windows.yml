@@ -96,6 +96,19 @@ jobs:
       # AZURE_* secrets are identifiers, not passwords.
       # Skips cleanly if the secrets are absent, so a fork or a
       # credential-less run still produces the unsigned installer it used to.
+      # trusted-signing-action authenticates via DefaultAzureCredential, which
+      # has no idea about GitHub OIDC on its own — the first run fell through
+      # every credential in the chain (CLI, Developer CLI, Visual Studio...) and
+      # died with "SignerSign() failed". azure/login performs the federated token
+      # exchange and leaves the runner in a state DefaultAzureCredential can use.
+      - name: Azure login (federated / OIDC)
+        if: ${{ env.AZURE_CLIENT_ID != '' }}
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
       - name: Sign installer (Azure Trusted Signing)
         id: sign
         if: ${{ env.AZURE_CLIENT_ID != '' }}
