@@ -106,7 +106,10 @@ jobs:
           endpoint: https://eus.codesigning.azure.net/
           trusted-signing-account-name: mlcsigning
           certificate-profile-name: mlc-public-trust
-          files: ${{ steps.pkg.outputs.exe }}
+          # ⚠ MUST be absolute: the signing client rejects a relative path
+          # outright with "The file path '...' is not rooted." The rename step
+          # always produces this exact filename, so this stays deterministic.
+          files: ${{ github.workspace }}\windows-app\dist\MyLinedChart-Windows-Setup.exe
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
