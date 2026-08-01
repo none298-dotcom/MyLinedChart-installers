@@ -30,14 +30,26 @@ on:
         description: "How long to let the app run before judging it alive"
         default: "40"
         required: false
+      runner:
+        description: "Runner image — the NSIS System.dll crash may be OS-specific"
+        default: "windows-latest"
+        required: false
+        type: choice
+        options: ["windows-latest", "windows-2022", "windows-2025"]
 
 permissions:
   contents: read
 
 jobs:
   installed-smoke:
-    runs-on: windows-latest
+    runs-on: ${{ inputs.runner || 'windows-latest' }}
     steps:
+      - name: Report the runner OS
+        shell: pwsh
+        run: |
+          Write-Host (Get-CimInstance Win32_OperatingSystem | Select-Object -ExpandProperty Caption)
+          Write-Host "build: $([System.Environment]::OSVersion.Version)"
+
       - name: Download the installer
         shell: pwsh
         run: |
