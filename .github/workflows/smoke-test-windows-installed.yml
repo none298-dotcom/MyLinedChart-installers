@@ -166,13 +166,28 @@ jobs:
           "FATAL=$fatal" >> $env:GITHUB_ENV
 
       - name: Windows Application event log (where a startup throw actually lands)
+        id: eventlog
         if: always()
         shell: pwsh
         run: |
           $since = (Get-Date).AddMinutes(-10)
           $ev = Get-WinEvent -FilterHashtable @{LogName='Application'; StartTime=$since} -ErrorAction SilentlyContinue |
                 Where-Object { $_.LevelDisplayName -in @('Error','Warning') -and $_.Message -match 'MyLinedChart|Application Error|Faulting' }
-          if ($ev) { $ev | Select-Object TimeCreated,Id,LevelDisplayName,Message | Format-List }
+          if ($ev) {
+            $ev | Select-Object TimeCreated,Id,LevelDisplayName,Message | Format-List
+            # ★ The Electron "A JavaScript error occurred in the main process"
+            # dialog does NOT reliably reach the process's stdout/stderr — three
+            # runs scored GREEN while the app sat on a fatal
+            # "Cannot find module './export-builders'" dialog, because the text
+            # only ever appeared here. Scan the event log too, or the gate lies.
+            $joined = ($ev | ForEach-Object { $_.Message }) -join "`n"
+            foreach ($pat in @('A JavaScript error occurred','Cannot find module','Uncaught Exception')) {
+              if ($joined -match [regex]::Escape($pat)) {
+                Write-Host "::error::Fatal startup error found in the Application event log: $pat"
+                "FATAL=True" >> $env:GITHUB_ENV
+              }
+            }
+          }
           else { Write-Host "no matching Application-log entries" }
 
       - name: Upload evidence
