@@ -121,12 +121,37 @@ jobs:
           Write-Host "----- stdout -----"; if (Test-Path $out) { Get-Content $out }
           Write-Host "----- stderr -----"; if (Test-Path $err) { Get-Content $err }
 
+          # ★ "Still running" is NOT "working". Electron shows a modal
+          # "A JavaScript error occurred in the main process" dialog and KEEPS
+          # THE PROCESS ALIVE, so a main-process throw scores as a pass on the
+          # liveness check alone. That exact false green happened on the first
+          # run of this workflow: the installer was fixed, the job went green,
+          # and only the screenshot showed the app sitting on a fatal
+          # "Cannot find module './export-builders'" dialog.
+          $crashText = ""
+          foreach ($f in @($out, $err)) {
+            if (Test-Path $f) { $crashText += (Get-Content $f -Raw -ErrorAction SilentlyContinue) }
+          }
+          $fatalPatterns = @(
+            'A JavaScript error occurred',
+            'Uncaught Exception',
+            'Cannot find module'
+          )
+          $fatal = $false
+          foreach ($pat in $fatalPatterns) {
+            if ($crashText -match [regex]::Escape($pat)) {
+              Write-Host "::error::Fatal startup error detected in output: $pat"
+              $fatal = $true
+            }
+          }
+
           if (-not $alive) {
             Write-Host "::error::THE INSTALLED APP EXITED ON ITS OWN (exit code $($p.ExitCode)) - this reproduces the Store rejection."
           } else {
             Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
           }
           "ALIVE=$alive" >> $env:GITHUB_ENV
+          "FATAL=$fatal" >> $env:GITHUB_ENV
 
       - name: Windows Application event log (where a startup throw actually lands)
         if: always()
@@ -155,4 +180,5 @@ jobs:
         shell: pwsh
         run: |
           if ($env:ALIVE -ne 'True') { throw "Installed app did not stay running." }
-          Write-Host "Installed app launched and stayed running."
+          if ($env:FATAL -eq 'True') { throw "Installed app stayed running but reported a fatal startup error (see the log and screenshot)." }
+          Write-Host "Installed app launched, stayed running, and reported no fatal startup error."
