@@ -79,6 +79,68 @@ jobs:
           Write-Host "installer exit code: $($p.ExitCode)"
           if ($p.ExitCode -ne 0) { throw "Silent install failed with exit code $($p.ExitCode)" }
 
+      # ★★ The two things Microsoft certification actually checks. Added after
+      # the 2026-08-03 rejection, which failed BOTH:
+      #   10.1.2.10  "no accessible method of being launched"
+      #   10.2.7     "no entry in the Add or Remove Programs list"
+      # Neither was an app defect — the installer was per-user, so shortcuts and
+      # the uninstall key lived in the installing user's profile where a
+      # certifier inspecting the machine never saw them. Asserting both here is
+      # the only way to know the fix holds without waiting days for a re-review.
+      - name: Assert a Start Menu shortcut exists (policy 10.1.2.10)
+        shell: pwsh
+        run: |
+          $roots = @(
+            "$env:ProgramData\Microsoft\Windows\Start Menu\Programs",
+            "$env:APPDATA\Microsoft\Windows\Start Menu\Programs"
+          )
+          $found = @()
+          foreach ($r in $roots) {
+            if (-not (Test-Path $r)) { continue }
+            $found += Get-ChildItem $r -Recurse -Filter 'MyLinedChart*.lnk' -ErrorAction SilentlyContinue
+          }
+          if (-not $found) {
+            Write-Host "::error::No MyLinedChart Start Menu shortcut. This is exactly what certification 10.1.2.10 rejected."
+            foreach ($r in $roots) { if (Test-Path $r) { Write-Host "--- $r"; Get-ChildItem $r -Recurse -Filter '*.lnk' -EA SilentlyContinue | Select-Object -First 25 FullName } }
+            exit 1
+          }
+          $found | ForEach-Object { Write-Host "shortcut: $($_.FullName)" }
+          # ALL USERS is what a certifier sees. A shortcut only under APPDATA is
+          # the per-user install that failed, so warn loudly rather than pass.
+          $allUsers = $found | Where-Object { $_.FullName -like "$env:ProgramData*" }
+          if (-not $allUsers) {
+            Write-Host "::error::Shortcut exists only in the per-user Start Menu. perMachine must be true."
+            exit 1
+          }
+
+      - name: Assert an Add or Remove Programs entry exists (policy 10.2.7)
+        shell: pwsh
+        run: |
+          $keys = @(
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+          )
+          $entry = $null
+          foreach ($k in $keys) {
+            $entry = Get-ItemProperty $k -ErrorAction SilentlyContinue |
+                     Where-Object { $_.DisplayName -like '*MyLinedChart*' } | Select-Object -First 1
+            if ($entry) { break }
+          }
+          if (-not $entry) {
+            Write-Host "::error::No HKLM uninstall entry. This is exactly what certification 10.2.7 rejected."
+            Write-Host "--- HKCU (where a per-user install would have written it) ---"
+            Get-ItemProperty 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*' -EA SilentlyContinue |
+              Where-Object { $_.DisplayName -like '*MyLinedChart*' } |
+              Select-Object DisplayName,UninstallString | Format-List
+            exit 1
+          }
+          Write-Host "ARP DisplayName:     $($entry.DisplayName)"
+          Write-Host "ARP UninstallString: $($entry.UninstallString)"
+          if (-not $entry.UninstallString) {
+            Write-Host "::error::Uninstall entry has no UninstallString — nothing for the user to run."
+            exit 1
+          }
+
       - name: Locate the installed binary
         id: locate
         shell: pwsh
