@@ -24,7 +24,12 @@ on:
     inputs:
       exe_url:
         description: "Direct URL of the installer to test (defaults to the beta release asset)"
-        default: "https://github.com/none298-dotcom/MyLinedChart-installers/releases/download/beta/MyLinedChart-Windows-Setup.exe"
+        # ★ `latest` is the only release tag now. The "beta" tag was retired on
+        # 2026-08-03 because the site downloaded from `latest` while the build
+        # workflows published to `beta`, so the site served a stale EXE for two
+        # days. A smoke test defaulting to the dead tag would happily certify an
+        # installer nobody ships.
+        default: "https://github.com/none298-dotcom/MyLinedChart-installers/releases/download/latest/MyLinedChart-Windows-Setup.exe"
         required: false
       wait_seconds:
         description: "How long to let the app run before judging it alive"
