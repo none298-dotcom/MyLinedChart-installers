@@ -19,8 +19,8 @@ on:
         default: "main"
         required: true
       release_tag:
-        description: "Release tag to publish the .exe under"
-        default: "beta"
+        description: "Release tag to publish the .exe under. 'latest' is what the WEBSITE links to — do not change it without changing the site too."
+        default: "latest"
         required: true
       build_epoch:
         description: "Unix epoch to stamp into build-info.json (must match latest.json). 0 = use now."
@@ -156,7 +156,7 @@ jobs:
           # create the release if the tag doesn't exist yet, else just (re)upload the asset
           gh release create "$tag" "$exe" \
             --repo "${{ github.repository }}" \
-            --title "MyLinedChart Windows (beta)" \
-            --notes "Beta installer, Authenticode-signed by Little Bird Trading LLC via Azure Trusted Signing." \
+            --title "MyLinedChart Windows" \
+            --notes "Authenticode-signed by Little Bird Trading LLC via Azure Trusted Signing." \
             || gh release upload "$tag" "$exe" --clobber --repo "${{ github.repository }}"
           echo "Published $exe to release '$tag'"

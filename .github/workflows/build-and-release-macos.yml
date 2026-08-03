@@ -34,7 +34,7 @@ on:
         required: true
       release_tag:
         description: "Release tag to publish the .dmg under"
-        default: "beta"
+        default: "latest"
         required: true
 
 permissions:
@@ -125,7 +125,7 @@ jobs:
           # create the release if the tag doesn't exist yet, else just (re)upload the asset
           gh release create "$tag" "$dmg" \
             --repo "${{ github.repository }}" \
-            --title "MyLinedChart (beta)" \
-            --notes "Unsigned-for-notarization beta installers. macOS: right-click > Open (or System Settings > Privacy & Security > Open Anyway). Windows: More info > Run anyway." \
+            --title "MyLinedChart" \
+            --notes "Installers. macOS: right-click > Open (or System Settings > Privacy & Security > Open Anyway). Windows: More info > Run anyway." \
             || gh release upload "$tag" "$dmg" --clobber --repo "${{ github.repository }}"
           echo "Published $dmg to release '$tag'"
