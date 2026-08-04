@@ -197,6 +197,21 @@ jobs:
             $g.Dispose(); $bmp.Dispose()
           } catch { Write-Host "::warning::screenshot failed: $($_.Exception.Message)" }
 
+            # ★★ A VISIBLE WINDOW, not just a live process. The app now uses
+            # show:false + 'ready-to-show' so launch does not flash an empty
+            # window. That is a real improvement AND a real hazard: if
+            # ready-to-show never fires, the process lives forever with NOTHING
+            # on screen and every check above still passes. MainWindowHandle is
+            # 0 until a window is actually shown, so this is what separates
+            # "running" from "the user can see it".
+            $p.Refresh()
+            Write-Host "main window handle: $($p.MainWindowHandle)"
+            Write-Host "main window title:  $($p.MainWindowTitle)"
+            if ($alive -and $p.MainWindowHandle -eq 0) {
+              Write-Host "::error::Running but NO visible window (MainWindowHandle=0). A ready-to-show that never fires looks exactly like this."
+              exit 1
+            }
+
           Write-Host "----- stdout -----"; if (Test-Path $out) { Get-Content $out }
           Write-Host "----- stderr -----"; if (Test-Path $err) { Get-Content $err }
 
