@@ -18,6 +18,26 @@ name: Smoke test INSTALLED Windows app
 # installed exe, and prove it is still alive. It also collects the Windows
 # Application event log, because an Electron main-process throw at startup
 # leaves an Application Error / .NET Runtime entry there and nowhere else.
+#
+# ★★ 2026-08-06 EXTENSION — "still alive" is not "works". Microsoft rejected
+# this app's Store submission THREE times; twice the cause was a "Sign up"
+# button that did nothing at all. The chart posts a bridge message
+# (desktopAuthFlow / start_signup), the Windows shell had no handler for it,
+# the message was silently dropped, and the button did not respond to user
+# input. That is now fixed in windows-app/main.js's
+# ipcMain.on('mlc-app-message') handler, but NOTHING had ever actually
+# clicked the button end to end to prove it — every check above this point
+# only proves the process launches and a window is visible, which was
+# exactly what stayed green on both rejected builds.
+#
+# The steps below launch the installed app with --remote-debugging-port,
+# click the real "Sign up" control over the Chrome DevTools Protocol (a DOM
+# click, not a coordinate click and not a direct call into the handler), and
+# assert on the app's own stdout that startDesktopSignIn() logged a sign-in
+# URL carrying /signup and a PKCE code_challenge/code_challenge_method=S256.
+# PKCE is the OTHER half of why Windows sign-in was broken: the server
+# rejects any desktop auth exchange that arrives without it, which surfaced
+# to users as "your app version is out of date" even after a browser opened.
 
 on:
   workflow_dispatch:
@@ -181,7 +201,13 @@ jobs:
           # ELECTRON_ENABLE_LOGGING surfaces renderer console output on stderr,
           # which is where a bundled-chart failure shows up.
           $env:ELECTRON_ENABLE_LOGGING = "1"
-          $p = Start-Process -FilePath $exe -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+          # ★ --remote-debugging-port opens the Chrome DevTools Protocol on the
+          # INSTALLED, PACKAGED exe -- the same binary the certifier runs, not
+          # a dev/source build. This is a standard Chromium/Electron switch
+          # handled before any of the app's own JS runs, so packaging does not
+          # disable it; it is what lets the step below click the real "Sign
+          # up" button instead of trusting that it works.
+          $p = Start-Process -FilePath $exe -ArgumentList '--remote-debugging-port=9222' -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
           Start-Sleep -Seconds $wait
 
           $alive = -not $p.HasExited
@@ -212,6 +238,158 @@ jobs:
               exit 1
             }
 
+          # ★★ Click "Sign up" over the Chrome DevTools Protocol and prove the
+          # bridge actually fires. WHY THIS EXISTS: on TWO separate Store
+          # rejections, the certifier hit a "Sign up" button that did nothing
+          # -- the chart posted a bridge message, nothing on the Windows side
+          # had a case for it, and the click was silently swallowed. Every
+          # check up to this point (alive, visible window, no fatal dialog)
+          # was ALSO green on both of those rejected builds, so none of it
+          # would have caught this. This is the one check that actually
+          # presses the button.
+          #
+          # This drives the REAL path end to end: a DOM click on the actual
+          # auth-gate control -> the chart's requestDesktopSignupFlow() ->
+          # the WKWebView-shaped window.webkit.messageHandlers.app.postMessage
+          # shim installed by preload.js -> ipcRenderer.send('mlc-app-message')
+          # -> the ipcMain.on('mlc-app-message') handler in main.js ->
+          # startDesktopSignIn(SIGNUP_PATH). Calling the handler directly, or
+          # evaluating the URL builder in isolation, would prove nothing about
+          # the wiring that actually broke -- it has to go through the DOM,
+          # same as a real user's click does.
+          function Invoke-CdpEval {
+            param(
+              [Parameter(Mandatory = $true)][string]$WebSocketUrl,
+              [Parameter(Mandatory = $true)][string]$Expression,
+              [int]$TimeoutSeconds = 15
+            )
+            $requestId = 9001
+            $ws = New-Object System.Net.WebSockets.ClientWebSocket
+            $connectCts = New-Object System.Threading.CancellationTokenSource ([TimeSpan]::FromSeconds($TimeoutSeconds))
+            $ws.ConnectAsync([Uri]$WebSocketUrl, $connectCts.Token).GetAwaiter().GetResult()
+            try {
+              $command = @{
+                id     = $requestId
+                method = 'Runtime.evaluate'
+                params = @{ expression = $Expression; returnByValue = $true; awaitPromise = $false }
+              }
+              $json = $command | ConvertTo-Json -Depth 10 -Compress
+              $sendBytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+              $sendSeg = New-Object System.ArraySegment[byte] (, $sendBytes)
+              $ws.SendAsync($sendSeg, [System.Net.WebSockets.WebSocketMessageType]::Text, $true, $connectCts.Token).GetAwaiter().GetResult() | Out-Null
+
+              $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+              while ((Get-Date) -lt $deadline) {
+                $recvBuffer = New-Object byte[] 262144
+                $recvSeg = New-Object System.ArraySegment[byte] (, $recvBuffer)
+                $recvCts = New-Object System.Threading.CancellationTokenSource ([TimeSpan]::FromSeconds(5))
+                $recvResult = $ws.ReceiveAsync($recvSeg, $recvCts.Token).GetAwaiter().GetResult()
+                $recvText = [System.Text.Encoding]::UTF8.GetString($recvBuffer, 0, $recvResult.Count)
+                if ([string]::IsNullOrWhiteSpace($recvText)) { continue }
+                $recvMsg = $recvText | ConvertFrom-Json
+                # The socket also carries unrelated CDP events (Page/Network/etc.)
+                # ahead of our reply -- skip anything that is not our own request id.
+                if ($null -ne $recvMsg.id -and $recvMsg.id -eq $requestId) {
+                  return $recvMsg
+                }
+              }
+              throw "Timed out waiting for a Runtime.evaluate response over CDP."
+            } finally {
+              try {
+                $ws.CloseAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure, 'done', [System.Threading.CancellationToken]::None).GetAwaiter().GetResult()
+              } catch { }
+              $ws.Dispose()
+            }
+          }
+
+          # Matches the chart's own two "Sign up" controls (the auth gate's
+          # authGateSignUpButton and a trial-CTA button with identical text) by
+          # trimmed textContent, exactly as this task specified, then narrows
+          # to VISIBLE elements and prefers the auth-gate button by id -- an
+          # element that "matches" but is hidden behind another panel is not a
+          # click a real user could make, and must not count as a pass.
+          # ★ Written as ONE line, not a PowerShell here-string: a here-string
+          # terminator (`'@`) must sit at column 0 with no leading whitespace,
+          # which is incompatible with this whole script being YAML block-
+          # scalar content indented under `run: |` -- an indented here-string
+          # here breaks the YAML parse, not just the PowerShell.
+          $signupClickExpression = '(function(){var candidates=Array.prototype.slice.call(document.querySelectorAll("button, [role=button], a"));var matches=candidates.filter(function(el){return (el.textContent||"").trim()==="Sign up";});var visible=matches.filter(function(el){return !!(el.offsetParent||(el.getClientRects&&el.getClientRects().length));});var target=visible.filter(function(el){return el.id==="authGateSignUpButton";})[0]||visible[0];if(!target){return JSON.stringify({found:false,totalTextMatches:matches.length,visibleTextMatches:visible.length});}target.click();return JSON.stringify({found:true,id:target.id||null,totalTextMatches:matches.length,visibleTextMatches:visible.length});})()'
+
+          if ($alive) {
+            $devtoolsReady = $false
+            $pageTarget = $null
+            $devtoolsDeadline = (Get-Date).AddSeconds(30)
+            Write-Host "Waiting for the DevTools endpoint at http://127.0.0.1:9222/json to list a page target..."
+            while ((Get-Date) -lt $devtoolsDeadline) {
+              try {
+                $targets = Invoke-RestMethod -Uri 'http://127.0.0.1:9222/json' -UseBasicParsing -TimeoutSec 3
+                $pageTarget = $targets | Where-Object { $_.type -eq 'page' -and $_.webSocketDebuggerUrl } | Select-Object -First 1
+                if ($pageTarget) { $devtoolsReady = $true; break }
+              } catch {
+                # Port not listening yet, or no page target registered yet -- keep polling.
+              }
+              Start-Sleep -Seconds 1
+            }
+            "DEVTOOLS_READY=$devtoolsReady" >> $env:GITHUB_ENV
+
+            $signupClicked = $false
+            $signupClickDetail = '(devtools never became ready)'
+            if ($devtoolsReady) {
+              Write-Host "DevTools page target: $($pageTarget.url)"
+              try {
+                $evalResult = Invoke-CdpEval -WebSocketUrl $pageTarget.webSocketDebuggerUrl -Expression $signupClickExpression -TimeoutSeconds 15
+                if ($evalResult.error) {
+                  throw "Runtime.evaluate returned a protocol error: $($evalResult.error | ConvertTo-Json -Compress)"
+                }
+                $rawValue = $evalResult.result.result.value
+                Write-Host "Runtime.evaluate result: $rawValue"
+                $clickInfo = $rawValue | ConvertFrom-Json
+                $signupClicked = [bool]$clickInfo.found
+                $signupClickDetail = "totalTextMatches=$($clickInfo.totalTextMatches) visibleTextMatches=$($clickInfo.visibleTextMatches) id=$($clickInfo.id)"
+              } catch {
+                $signupClickDetail = "CDP eval threw: $($_.Exception.Message)"
+                Write-Host "::error::CDP click of the Sign up button failed: $($_.Exception.Message)"
+              }
+            } else {
+              Write-Host "::error::DevTools endpoint at 127.0.0.1:9222 never listed a page target within 30s. If Electron is refusing --remote-debugging-port on the packaged build, this step needs a PowerShell UIAutomation fallback instead of CDP."
+            }
+
+            if (-not $signupClicked) {
+              # ★ A MISSING OR UNCLICKABLE BUTTON IS ITSELF A REAL FAILURE --
+              # this is the exact shape of both prior Store rejections. Do not
+              # let this pass quietly; the final gate step below fails the run.
+              Write-Host "::error::Could not find and click a visible 'Sign up' control ($signupClickDetail). This is exactly what caused two Store rejections: a dead auth-gate button."
+            } else {
+              Write-Host "Clicked Sign up ($signupClickDetail)"
+            }
+            "SIGNUP_CLICKED=$signupClicked" >> $env:GITHUB_ENV
+
+            # Give the main process a moment to run startDesktopSignIn and flush
+            # its console.log line to the redirected stdout file before it is
+            # read below. shell.openExternal() may be slow or fail entirely on
+            # a headless runner with no default browser -- that is fine, the
+            # assertion below only depends on the console.log call that happens
+            # BEFORE openExternal is even invoked (see windows-app/main.js's
+            # startDesktopSignIn).
+            Start-Sleep -Seconds 3
+
+            try {
+              Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+              $bAfter = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+              $bmpAfter = New-Object System.Drawing.Bitmap $bAfter.Width, $bAfter.Height
+              $gAfter = [System.Drawing.Graphics]::FromImage($bmpAfter)
+              $gAfter.CopyFromScreen($bAfter.Location, [System.Drawing.Point]::Empty, $bAfter.Size)
+              $bmpAfter.Save((Join-Path $PWD 'installed-app-after-signup-click.png'), [System.Drawing.Imaging.ImageFormat]::Png)
+              $gAfter.Dispose(); $bmpAfter.Dispose()
+            } catch { Write-Host "::warning::post-click screenshot failed: $($_.Exception.Message)" }
+          } else {
+            Write-Host "::warning::Skipping the Sign up click - the app was not still running."
+            $devtoolsReady = $false
+            $signupClicked = $false
+            "DEVTOOLS_READY=False" >> $env:GITHUB_ENV
+            "SIGNUP_CLICKED=False" >> $env:GITHUB_ENV
+          }
+
           Write-Host "----- stdout -----"; if (Test-Path $out) { Get-Content $out }
           Write-Host "----- stderr -----"; if (Test-Path $err) { Get-Content $err }
 
@@ -238,6 +416,69 @@ jobs:
               $fatal = $true
             }
           }
+
+          # ★★ THE ASSERTION THIS WHOLE EXTENSION EXISTS FOR. A click landing
+          # is not enough by itself -- main.js could handle the bridge message
+          # and still build a broken URL. startDesktopSignIn() (main.js) logs
+          # the exact URL it is about to hand to shell.openExternal:
+          #   console.log('[auth] opening desktop sign-in:', loginUrl)
+          # Check three things against that one line:
+          #   /signup                        -> start_signup routed to the
+          #                                      SIGNUP path, not silently
+          #                                      falling back to LOGIN_PATH
+          #   code_challenge=                -> a PKCE challenge is present
+          #   code_challenge_method=S256     -> using the S256 method
+          # Windows never sent PKCE before this fix, and the server REJECTS
+          # any desktop sign-in that arrives without it -- users experienced
+          # that rejection as "your app version is out of date" even though a
+          # browser had, by then, at least opened.
+          $signupLogOk = $false
+          $signupFailReason = ''
+          # ★ Use the LOCAL $signupClicked variable, not $env:SIGNUP_CLICKED --
+          # the "SIGNUP_CLICKED=..." >> $env:GITHUB_ENV write above only takes
+          # effect for steps AFTER this one finishes; within this same script
+          # $env:SIGNUP_CLICKED is still whatever it was when the process
+          # started (i.e. unset), so it must not be read here.
+          if ($signupClicked) {
+            $signInLine = ($crashText -split "`n") | Where-Object { $_ -match '\[auth\] opening desktop sign-in:' } | Select-Object -Last 1
+            if (-not $signInLine) {
+              $signupFailReason = "No '[auth] opening desktop sign-in:' line in stdout after clicking Sign up. startDesktopSignIn() never ran, or the bridge message was dropped again -- the exact silent-failure shape of the two prior Store rejections."
+            } else {
+              Write-Host "sign-in log line: $signInLine"
+              $urlMatch = [regex]::Match($signInLine, '\[auth\] opening desktop sign-in:\s*(\S+)')
+              $signInUrl = if ($urlMatch.Success) { $urlMatch.Groups[1].Value } else { '' }
+              # ⚠ DECODE BEFORE MATCHING. The PKCE parameters ride inside the `next=`
+              # query parameter, so they arrive percent-encoded:
+              #   ...next=%2Fdesktop-auth%2F...%26code_challenge%3DZXZ...
+              # A literal search for `code_challenge=` finds nothing and reports a missing
+              # PKCE handshake on a build whose handshake is perfectly correct -- which is
+              # exactly what the first run of this check did on 2026-08-06. The app was
+              # right and the assertion was wrong.
+              # Unescape until it stops changing; do not hard-code the nesting depth.
+              $decodedUrl = $signInUrl
+              for ($d = 0; $d -lt 5; $d++) {
+                $nextUrl = [System.Uri]::UnescapeDataString($decodedUrl)
+                if ($nextUrl -eq $decodedUrl) { break }
+                $decodedUrl = $nextUrl
+              }
+              if (-not $signInUrl) {
+                $signupFailReason = "Found the sign-in log line but could not parse a URL out of it: $signInLine"
+              } elseif ($decodedUrl -notmatch '/signup') {
+                $signupFailReason = "The sign-in URL does not contain /signup ($signInUrl) - start_signup is routing to the LOGIN path instead of the SIGNUP path."
+              } elseif ($decodedUrl -notmatch 'code_challenge=') {
+                $signupFailReason = "The sign-in URL is missing code_challenge= ($signInUrl) - the PKCE handshake is not in the authorize URL; the server will reject this sign-in."
+              } elseif ($decodedUrl -notmatch 'code_challenge_method=S256') {
+                $signupFailReason = "The sign-in URL is missing code_challenge_method=S256 ($signInUrl) - PKCE is present but not using the S256 method the server requires; the server will reject this sign-in."
+              } else {
+                $signupLogOk = $true
+                Write-Host "Sign-in URL carries /signup + code_challenge + code_challenge_method=S256: $signInUrl"
+              }
+            }
+          } else {
+            $signupFailReason = "Sign up was never clicked (see the DEVTOOLS_READY/SIGNUP_CLICKED diagnostics above), so there is nothing to assert about the sign-in URL."
+          }
+          "SIGNUP_LOG_OK=$signupLogOk" >> $env:GITHUB_ENV
+          "SIGNUP_FAIL_REASON=$signupFailReason" >> $env:GITHUB_ENV
 
           if (-not $alive) {
             Write-Host "::error::THE INSTALLED APP EXITED ON ITS OWN (exit code $($p.ExitCode)) - this reproduces the Store rejection."
@@ -279,6 +520,7 @@ jobs:
           name: installed-smoke
           path: |
             installed-app.png
+            installed-app-after-signup-click.png
             installed-stdout.log
             installed-stderr.log
           if-no-files-found: warn
@@ -290,4 +532,18 @@ jobs:
         run: |
           if ($env:ALIVE -ne 'True') { throw "Installed app did not stay running." }
           if ($env:FATAL -eq 'True') { throw "Installed app stayed running but reported a fatal startup error (see the log and screenshot)." }
-          Write-Host "Installed app launched, stayed running, and reported no fatal startup error."
+
+          # ★★ These three gate the actual reason this workflow was extended.
+          # "Still running" and "no fatal error" were BOTH green on the two
+          # builds Microsoft rejected for a dead "Sign up" button -- neither
+          # check says anything about whether that button works. Only these do.
+          if ($env:DEVTOOLS_READY -ne 'True') {
+            throw "Chrome DevTools endpoint at 127.0.0.1:9222 never listed a page target - could not verify the Sign up button at all. If --remote-debugging-port is being refused by the packaged build, this workflow needs a UIAutomation-based fallback instead of CDP."
+          }
+          if ($env:SIGNUP_CLICKED -ne 'True') {
+            throw "No visible 'Sign up' control was found and clicked. This is exactly the shape of both prior Store rejections: a dead or missing auth-gate button."
+          }
+          if ($env:SIGNUP_LOG_OK -ne 'True') {
+            throw "Clicking Sign up did not produce a valid PKCE sign-in URL: $env:SIGNUP_FAIL_REASON"
+          }
+          Write-Host "Installed app launched, stayed running, reported no fatal startup error, and clicking Sign up drove a real /signup PKCE (S256) sign-in URL."
