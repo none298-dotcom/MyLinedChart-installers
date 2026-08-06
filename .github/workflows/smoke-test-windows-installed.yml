@@ -447,13 +447,27 @@ jobs:
               Write-Host "sign-in log line: $signInLine"
               $urlMatch = [regex]::Match($signInLine, '\[auth\] opening desktop sign-in:\s*(\S+)')
               $signInUrl = if ($urlMatch.Success) { $urlMatch.Groups[1].Value } else { '' }
+              # ⚠ DECODE BEFORE MATCHING. The PKCE parameters ride inside the `next=`
+              # query parameter, so they arrive percent-encoded:
+              #   ...next=%2Fdesktop-auth%2F...%26code_challenge%3DZXZ...
+              # A literal search for `code_challenge=` finds nothing and reports a missing
+              # PKCE handshake on a build whose handshake is perfectly correct -- which is
+              # exactly what the first run of this check did on 2026-08-06. The app was
+              # right and the assertion was wrong.
+              # Unescape until it stops changing; do not hard-code the nesting depth.
+              $decodedUrl = $signInUrl
+              for ($d = 0; $d -lt 5; $d++) {
+                $nextUrl = [System.Uri]::UnescapeDataString($decodedUrl)
+                if ($nextUrl -eq $decodedUrl) { break }
+                $decodedUrl = $nextUrl
+              }
               if (-not $signInUrl) {
                 $signupFailReason = "Found the sign-in log line but could not parse a URL out of it: $signInLine"
-              } elseif ($signInUrl -notmatch '/signup') {
+              } elseif ($decodedUrl -notmatch '/signup') {
                 $signupFailReason = "The sign-in URL does not contain /signup ($signInUrl) - start_signup is routing to the LOGIN path instead of the SIGNUP path."
-              } elseif ($signInUrl -notmatch 'code_challenge=') {
+              } elseif ($decodedUrl -notmatch 'code_challenge=') {
                 $signupFailReason = "The sign-in URL is missing code_challenge= ($signInUrl) - the PKCE handshake is not in the authorize URL; the server will reject this sign-in."
-              } elseif ($signInUrl -notmatch 'code_challenge_method=S256') {
+              } elseif ($decodedUrl -notmatch 'code_challenge_method=S256') {
                 $signupFailReason = "The sign-in URL is missing code_challenge_method=S256 ($signInUrl) - PKCE is present but not using the S256 method the server requires; the server will reject this sign-in."
               } else {
                 $signupLogOk = $true
