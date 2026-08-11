@@ -60,14 +60,6 @@ jobs:
         working-directory: windows-app
         run: npm ci
 
-      - name: Stamp build-info.json (in-app update checker epoch)
-        shell: bash
-        run: |
-          ep="${{ inputs.build_epoch }}"
-          if [ "$ep" = "0" ] || [ -z "$ep" ]; then ep="$(date +%s)"; fi
-          printf '{ "buildEpoch": %s }\n' "$ep" > windows-app/build-info.json
-          cat windows-app/build-info.json
-
       - name: Build NSIS installer (.exe)
         working-directory: windows-app
         # predist:win extracts the bundled connector, then electron-builder makes the x64 NSIS installer
@@ -78,13 +70,16 @@ jobs:
           # two separate means a signing failure cannot corrupt the package.
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
 
-      - name: Rename installer to a stable name
+      # ★ No rename step any more. electron-builder's `artifactName` produces
+      # MyLinedChart-Windows-Setup.exe directly, because latest.yml names the
+      # file it expects to download -- renaming afterwards pointed every client
+      # at a 404.
+      - name: Locate the installer
         id: pkg
         shell: bash
         run: |
-          src="$(ls windows-app/dist/*.exe | head -1)"
           out="windows-app/dist/MyLinedChart-Windows-Setup.exe"
-          [ "$src" = "$out" ] || mv "$src" "$out"
+          test -f "$out" || { echo "expected $out from electron-builder"; ls -la windows-app/dist; exit 1; }
           echo "exe=$out" >> "$GITHUB_OUTPUT"
           echo "Built: $out"
 
@@ -127,6 +122,34 @@ jobs:
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
 
+      # ★★ RE-HASH latest.yml AFTER SIGNING.
+      #
+      # electron-builder writes latest.yml (version + sha512 + size) at package
+      # time, and the Trusted Signing step above then REWRITES the .exe. The
+      # manifest therefore describes bytes that no longer exist, and
+      # electron-updater verifies sha512 before installing -- so every client
+      # would download the update and refuse it as corrupt. Recompute from the
+      # signed file, which is the only artifact anyone actually downloads.
+      #
+      # The .blockmap is deliberately NOT regenerated or published: it only
+      # enables differential downloads, it is equally invalidated by signing,
+      # and electron-updater falls back to a full download when it is absent.
+      - name: Re-hash latest.yml against the SIGNED installer
+        shell: pwsh
+        run: |
+          $exe = "${{ steps.pkg.outputs.exe }}"
+          $yml = "windows-app/dist/latest.yml"
+          $bytes = [System.IO.File]::ReadAllBytes($exe)
+          $sha = [Convert]::ToBase64String([System.Security.Cryptography.SHA512]::Create().ComputeHash($bytes))
+          $size = $bytes.Length
+          $text = Get-Content $yml -Raw
+          $text = [System.Text.RegularExpressions.Regex]::Replace($text, 'sha512: .*', "sha512: $sha")
+          $text = [System.Text.RegularExpressions.Regex]::Replace($text, 'size: .*', "size: $size")
+          Set-Content -Path $yml -Value $text -NoNewline
+          Write-Host "--- latest.yml (post-sign) ---"
+          Get-Content $yml
+          Remove-Item "$exe.blockmap" -ErrorAction SilentlyContinue
+
       - name: Verify the signature landed
         shell: pwsh
         run: |
@@ -154,9 +177,12 @@ jobs:
           tag="${{ inputs.release_tag }}"
           exe="${{ steps.pkg.outputs.exe }}"
           # create the release if the tag doesn't exist yet, else just (re)upload the asset
-          gh release create "$tag" "$exe" \
+          yml="windows-app/dist/latest.yml"
+          # latest.yml IS the update feed. Publishing the .exe without it means
+          # no installed app ever learns a new version exists.
+          gh release create "$tag" "$exe" "$yml" \
             --repo "${{ github.repository }}" \
             --title "MyLinedChart Windows" \
             --notes "Authenticode-signed by Little Bird Trading LLC via Azure Trusted Signing." \
-            || gh release upload "$tag" "$exe" --clobber --repo "${{ github.repository }}"
-          echo "Published $exe to release '$tag'"
+            || gh release upload "$tag" "$exe" "$yml" --clobber --repo "${{ github.repository }}"
+          echo "Published $exe and $yml to release '$tag'"
