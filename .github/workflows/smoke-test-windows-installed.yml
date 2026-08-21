@@ -577,4 +577,4 @@ jobs:
           if ($env:SIGNUP_LOG_OK -ne 'True') {
             throw "Clicking Sign up did not produce a valid PKCE sign-in URL: $env:SIGNUP_FAIL_REASON"
           }
-          Write-Host "Installed app launched, stayed running, reported no fatal startup error, and clicking Sign up drove a real /signup PKCE (S256) sign-in URL."
+          Write-Host "Installed app launched, stayed running, reported no fatal startup error, and clicking sign in drove a real PKCE (S256) sign-in URL."
