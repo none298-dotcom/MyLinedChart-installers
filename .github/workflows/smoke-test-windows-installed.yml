@@ -302,18 +302,34 @@ jobs:
             }
           }
 
-          # Matches the chart's own two "Sign up" controls (the auth gate's
-          # authGateSignUpButton and a trial-CTA button with identical text) by
-          # trimmed textContent, exactly as this task specified, then narrows
-          # to VISIBLE elements and prefers the auth-gate button by id -- an
-          # element that "matches" but is hidden behind another panel is not a
-          # click a real user could make, and must not count as a pass.
-          # ★ Written as ONE line, not a PowerShell here-string: a here-string
-          # terminator (`'@`) must sit at column 0 with no leading whitespace,
-          # which is incompatible with this whole script being YAML block-
-          # scalar content indented under `run: |` -- an indented here-string
-          # here breaks the YAML parse, not just the PowerShell.
-          $signupClickExpression = '(function(){var candidates=Array.prototype.slice.call(document.querySelectorAll("button, [role=button], a"));var matches=candidates.filter(function(el){return (el.textContent||"").trim()==="Sign up";});var visible=matches.filter(function(el){return !!(el.offsetParent||(el.getClientRects&&el.getClientRects().length));});var target=visible.filter(function(el){return el.id==="authGateSignUpButton";})[0]||visible[0];if(!target){return JSON.stringify({found:false,totalTextMatches:matches.length,visibleTextMatches:visible.length});}target.click();return JSON.stringify({found:true,id:target.id||null,totalTextMatches:matches.length,visibleTextMatches:visible.length});})()'
+          # ⚠⚠ REPOINTED 2026-08-21. This used to look for a visible control whose
+          # text was exactly "Sign up" and prefer #authGateSignUpButton. Both are
+          # gone: the login wall was deleted on 2026-08-13 in the app repo's
+          # 5d129548 "The door comes off for good: delete the wall, add one ask".
+          # The app now opens straight onto sample data and asks only when you
+          # reach for live data, so nothing says "Sign up" at launch and this
+          # check failed on a perfectly good build (run 32448097873).
+          #
+          # ★ That failure mode is the dangerous one for THIS workflow. It exists
+          # because a dead auth button got the app rejected from a Store twice;
+          # a version of it that cries wolf on every build teaches everyone to
+          # ignore the one alarm that has already caught a real rejection. So it
+          # is repointed rather than relaxed or deleted.
+          #
+          # Sign-in on Windows still works and still matters -- it just moved
+          # into the account menu behind the corner chip. Stage 1 clicks that
+          # chip; stage 2 clicks whatever sign-in control it reveals. Both stages
+          # report what they saw, so a future move shows up as a diagnostic
+          # rather than a mystery.
+          #
+          # ★ Written as ONE line each, not PowerShell here-strings: a here-string
+          # terminator (`'@`) must sit at column 0, which is incompatible with
+          # this script being YAML block-scalar content indented under `run: |`.
+          $openAccountMenuExpression = '(function(){var chip=document.getElementById("trialCtaChip");var vis=function(el){return !!(el&&(el.offsetParent||(el.getClientRects&&el.getClientRects().length)));};if(!vis(chip)){return JSON.stringify({chipVisible:false});}chip.click();return JSON.stringify({chipVisible:true,chipText:(chip.textContent||"").trim()});})()'
+          # Prefer the account menu's own button, then the trial-CTA sign-in,
+          # then anything visible reading "Sign in"/"Sign up" -- id first, so a
+          # cosmetic label change does not silently pass on the wrong element.
+          $signupClickExpression = '(function(){var vis=function(el){return !!(el&&(el.offsetParent||(el.getClientRects&&el.getClientRects().length)));};var ids=["desktopAuthSignInBtn","trialCtaSignIn"];var target=null;for(var i=0;i<ids.length;i++){var el=document.getElementById(ids[i]);if(vis(el)){target=el;break;}}var textMatches=[];if(!target){var all=Array.prototype.slice.call(document.querySelectorAll("button, [role=button], a"));textMatches=all.filter(function(el){var t=(el.textContent||"").trim().toLowerCase();return t==="sign in"||t==="sign up";});var visible=textMatches.filter(vis);target=visible[0]||null;}var present=ids.filter(function(id){return !!document.getElementById(id);});if(!target){return JSON.stringify({found:false,idsPresentInDom:present,textMatches:textMatches.length});}target.click();return JSON.stringify({found:true,id:target.id||null,label:(target.textContent||"").trim(),idsPresentInDom:present});})()'
 
           if ($alive) {
             $devtoolsReady = $false
@@ -337,6 +353,16 @@ jobs:
             if ($devtoolsReady) {
               Write-Host "DevTools page target: $($pageTarget.url)"
               try {
+                # Stage 1: open the account menu. Not fatal on its own -- if the
+                # sign-in control is already reachable, stage 2 still finds it.
+                try {
+                  $openResult = Invoke-CdpEval -WebSocketUrl $pageTarget.webSocketDebuggerUrl -Expression $openAccountMenuExpression -TimeoutSeconds 15
+                  Write-Host "Account-menu open stage: $($openResult.result.result.value)"
+                } catch {
+                  Write-Host "::warning::Could not click the account chip: $($_.Exception.Message)"
+                }
+                Start-Sleep -Seconds 2
+                # Stage 2: the click this workflow exists to make.
                 $evalResult = Invoke-CdpEval -WebSocketUrl $pageTarget.webSocketDebuggerUrl -Expression $signupClickExpression -TimeoutSeconds 15
                 if ($evalResult.error) {
                   throw "Runtime.evaluate returned a protocol error: $($evalResult.error | ConvertTo-Json -Compress)"
@@ -358,7 +384,7 @@ jobs:
               # ★ A MISSING OR UNCLICKABLE BUTTON IS ITSELF A REAL FAILURE --
               # this is the exact shape of both prior Store rejections. Do not
               # let this pass quietly; the final gate step below fails the run.
-              Write-Host "::error::Could not find and click a visible 'Sign up' control ($signupClickDetail). This is exactly what caused two Store rejections: a dead auth-gate button."
+              Write-Host "::error::Could not find and click a visible sign-in control ($signupClickDetail). This is exactly what caused two Store rejections: a dead auth button. If idsPresentInDom lists the ids but nothing was clickable, the control exists but is unreachable -- which is the same defect from the user's side."
             } else {
               Write-Host "Clicked Sign up ($signupClickDetail)"
             }
@@ -442,7 +468,7 @@ jobs:
           if ($signupClicked) {
             $signInLine = ($crashText -split "`n") | Where-Object { $_ -match '\[auth\] opening desktop sign-in:' } | Select-Object -Last 1
             if (-not $signInLine) {
-              $signupFailReason = "No '[auth] opening desktop sign-in:' line in stdout after clicking Sign up. startDesktopSignIn() never ran, or the bridge message was dropped again -- the exact silent-failure shape of the two prior Store rejections."
+              $signupFailReason = "No '[auth] opening desktop sign-in:' line in stdout after clicking sign in. startDesktopSignIn() never ran, or the bridge message was dropped again -- the exact silent-failure shape of the two prior Store rejections."
             } else {
               Write-Host "sign-in log line: $signInLine"
               $urlMatch = [regex]::Match($signInLine, '\[auth\] opening desktop sign-in:\s*(\S+)')
@@ -463,19 +489,24 @@ jobs:
               }
               if (-not $signInUrl) {
                 $signupFailReason = "Found the sign-in log line but could not parse a URL out of it: $signInLine"
-              } elseif ($decodedUrl -notmatch '/signup') {
-                $signupFailReason = "The sign-in URL does not contain /signup ($signInUrl) - start_signup is routing to the LOGIN path instead of the SIGNUP path."
+              } elseif ($decodedUrl -notmatch '/signup' -and $decodedUrl -notmatch '/login') {
+                # ⚠ Was: /signup only. The surviving entry point is the account
+                # menu's Sign In, which posts mode=start_reauth and main.js maps
+                # to LOGIN_PATH ('/login') -- correct behaviour that the old
+                # assertion would have failed. Either auth path is a pass; what
+                # must never regress is the PKCE handshake below.
+                $signupFailReason = "The sign-in URL contains neither /login nor /signup ($signInUrl) - desktopAuthFlow is not reaching startDesktopSignIn with a real auth path."
               } elseif ($decodedUrl -notmatch 'code_challenge=') {
                 $signupFailReason = "The sign-in URL is missing code_challenge= ($signInUrl) - the PKCE handshake is not in the authorize URL; the server will reject this sign-in."
               } elseif ($decodedUrl -notmatch 'code_challenge_method=S256') {
                 $signupFailReason = "The sign-in URL is missing code_challenge_method=S256 ($signInUrl) - PKCE is present but not using the S256 method the server requires; the server will reject this sign-in."
               } else {
                 $signupLogOk = $true
-                Write-Host "Sign-in URL carries /signup + code_challenge + code_challenge_method=S256: $signInUrl"
+                Write-Host "Sign-in URL carries an auth path + code_challenge + code_challenge_method=S256: $signInUrl"
               }
             }
           } else {
-            $signupFailReason = "Sign up was never clicked (see the DEVTOOLS_READY/SIGNUP_CLICKED diagnostics above), so there is nothing to assert about the sign-in URL."
+            $signupFailReason = "Sign in was never clicked (see the DEVTOOLS_READY/SIGNUP_CLICKED diagnostics above), so there is nothing to assert about the sign-in URL."
           }
           "SIGNUP_LOG_OK=$signupLogOk" >> $env:GITHUB_ENV
           "SIGNUP_FAIL_REASON=$signupFailReason" >> $env:GITHUB_ENV
@@ -541,7 +572,7 @@ jobs:
             throw "Chrome DevTools endpoint at 127.0.0.1:9222 never listed a page target - could not verify the Sign up button at all. If --remote-debugging-port is being refused by the packaged build, this workflow needs a UIAutomation-based fallback instead of CDP."
           }
           if ($env:SIGNUP_CLICKED -ne 'True') {
-            throw "No visible 'Sign up' control was found and clicked. This is exactly the shape of both prior Store rejections: a dead or missing auth-gate button."
+            throw "No visible sign-in control was found and clicked. This is exactly the shape of both prior Store rejections: a dead or missing auth button."
           }
           if ($env:SIGNUP_LOG_OK -ne 'True') {
             throw "Clicking Sign up did not produce a valid PKCE sign-in URL: $env:SIGNUP_FAIL_REASON"
