@@ -80,11 +80,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="$(node -p "require('./windows-app/package.json').version")"
-          url="https://dl.littlebirdtrading.com/connectors/${version}/MyLinedChart-IBKRConnector-Windows.zip"
+          # ⚠ The CONNECTOR has its own version, not the app's. Deriving this
+          # from windows-app/package.json (as the first version of this step did)
+          # couples them, so bumping the app to 1.0.12 would send CI looking for
+          # /connectors/1.0.12/ — which does not exist, because the Connector did
+          # not change. web/lib/downloads.ts is the single source of truth for
+          # this URL; the website serves the same file from the same constant.
+          url="$(node -e "
+            const fs = require('fs');
+            const src = fs.readFileSync('web/lib/downloads.ts', 'utf8');
+            const m = src.match(/WINDOWS_CONNECTOR_ZIP_PATH\s*=\s*[\"']([^\"']+)[\"']/);
+            if (!m) { console.error('WINDOWS_CONNECTOR_ZIP_PATH not found in web/lib/downloads.ts'); process.exit(1); }
+            console.log(m[1]);
+          ")"
           dest=".build/connectors/MyLinedChart-IBKRConnector-Windows.zip"
           mkdir -p "$(dirname "$dest")"
-          echo "Fetching Connector $version"
+          echo "Fetching Connector from $url"
           curl -fsSL --retry 3 --retry-delay 5 -o "$dest" "$url"
           # A 200 is not proof of a zip -- a misconfigured bucket happily returns
           # an HTML error page with one, and extract-zip's failure two steps later
