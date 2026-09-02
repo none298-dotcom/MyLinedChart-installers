@@ -22,10 +22,6 @@ on:
         description: "Release tag to publish the .exe under. 'latest' is what the WEBSITE links to — do not change it without changing the site too."
         default: "latest"
         required: true
-      build_epoch:
-        description: "Unix epoch to stamp into build-info.json (must match latest.json). 0 = use now."
-        default: "0"
-        required: true
 
 permissions:
   contents: write        # create/update the Release on this public repo

@@ -26,10 +26,6 @@ on:
         description: "Private-repo branch/tag/SHA to build from"
         default: "main"
         required: true
-      build_epoch:
-        description: "Build epoch for the in-app update check (0 = now)"
-        default: "0"
-        required: false
 
 permissions:
   contents: read
@@ -55,14 +51,6 @@ jobs:
       - name: Install dependencies
         working-directory: windows-app
         run: npm ci
-
-      - name: Stamp build-info.json (in-app update checker epoch)
-        shell: bash
-        run: |
-          ep="${{ inputs.build_epoch }}"
-          if [ "$ep" = "0" ] || [ -z "$ep" ]; then ep="$(date +%s)"; fi
-          printf '{ "buildEpoch": %s }\n' "$ep" > windows-app/build-info.json
-          cat windows-app/build-info.json
 
       - name: Build MSIX (appx target)
         working-directory: windows-app
