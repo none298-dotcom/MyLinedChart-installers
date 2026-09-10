@@ -136,10 +136,17 @@ jobs:
           $recorder = "(() => { window.__mlcProbe = {}; const prev = window.__mlcDesktopConnectorReceive; window.__mlcDesktopConnectorReceive = (env) => { try { if (env && typeof env.requestId === 'string' && env.requestId.indexOf('mlc-probe-') === 0) { window.__mlcProbe[env.requestId] = env; } } catch (e) {} if (typeof prev === 'function') { try { prev(env); } catch (e) {} } }; return 'recorder installed'; })()"
           Invoke-Cdp $recorder | Out-Null
 
-          # /search is the path this job was written for. /candles is a control:
-          # it has always been allowlisted, so if BOTH come back rejected the
-          # fault is this harness, not the allowlist.
+          # /search is the path this job was written for. /candles is a
+          # positive control: it has always been allowlisted, so if BOTH come
+          # back rejected the fault is this harness, not the allowlist.
           $paths = @('/search?q=BHP', '/candles?symbol=SPY')
+          # ★ NEGATIVE CONTROL. /diagnostics is a REAL bridge route that is
+          # deliberately NOT in IBKR_BRIDGE_ALLOWED_PATHS, so it MUST come back
+          # refused. Without this the job can only ever pass: a harness that
+          # never posts a message, or one whose recorder is broken, would look
+          # identical to success. This is the red half of red-before-green,
+          # asserted on every run rather than once by hand.
+          $mustBeRejected = '/diagnostics'
           $results = @{}
           foreach ($path in $paths) {
             $id = 'mlc-probe-' + ([guid]::NewGuid().ToString('N').Substring(0,8))
@@ -162,6 +169,19 @@ jobs:
             $results[$path] = $env_json
           }
 
+          # Run the negative control through the same path as the others.
+          $negId = 'mlc-probe-' + ([guid]::NewGuid().ToString('N').Substring(0,8))
+          $negExpr = "(() => { window.webkit.messageHandlers.app.postMessage({ action: 'ibkrConnectorNative', nativeAction: 'bridgeRequest', requestId: '$negId', payload: { path: '$mustBeRejected', method: 'GET', timeoutMs: 4000 } }); return 'posted'; })()"
+          Invoke-Cdp $negExpr | Out-Null
+          $negBody = $null
+          for ($i = 0; $i -lt 20; $i++) {
+            Start-Sleep -Milliseconds 700
+            $raw = Invoke-Cdp "JSON.stringify(window.__mlcProbe['$negId'] || null)"
+            $val = ($raw | ConvertFrom-Json).result.result.value
+            if ($val -and $val -ne 'null') { $negBody = [string]$val; break }
+          }
+          Write-Host "$mustBeRejected (negative control) -> $negBody"
+
           $ws.Dispose()
           Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
 
@@ -180,6 +200,16 @@ jobs:
               Write-Host "OK: $path cleared the Windows allowlist"
             }
           }
+          if (-not $negBody) {
+            Write-Host "::error::the negative control produced no response at all - this harness cannot tell a refusal from a success, so its passes mean nothing."
+            $failed = $true
+          } elseif ($negBody -notmatch 'rejected by the desktop whitelist') {
+            Write-Host "::error::$mustBeRejected was NOT refused. Either it was added to IBKR_BRIDGE_ALLOWED_PATHS (update this control), or this job cannot detect a refusal and every pass above is meaningless."
+            $failed = $true
+          } else {
+            Write-Host "OK: the negative control was refused, so a real refusal WOULD be caught"
+          }
+
           Write-Host "----- stdout -----"; if (Test-Path $out) { Get-Content $out }
           if ($failed) { exit 1 }
 
