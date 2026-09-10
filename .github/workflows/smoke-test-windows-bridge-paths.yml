@@ -1,0 +1,195 @@
+name: Smoke test Windows bridge path allowlist
+
+# ★ WHY THIS EXISTS
+#
+# A Connector bridge route has to be registered in FOUR places, and missing one
+# is SILENT:
+#
+#   1. the bridge handler          web/tools/ibkr_bridge_service.py
+#   2. the macOS proxy allowlist   mac-app-src/main.swift
+#   3. the chart's mirror of it    ibkrNativeProxyAllowedPaths
+#   4. the Windows allowlist       windows-app/main.js IBKR_BRIDGE_ALLOWED_PATHS
+#
+# Miss 2-4 and the request never leaves the app. Rejections there are swallowed
+# by design, so the feature reports an empty result and the Connector's log is
+# EMPTY -- which reads like "the code never ran". That is exactly backwards, and
+# it is what /active-provider (two weeks) and /search (2026-09-10) both cost.
+#
+# scripts/test-bridge-path-allowlists.mjs in the source repo pins the four lists
+# statically. This job proves the RUNTIME behaviour on the SHIPPED Windows
+# installer, which no static check can: it asks the packaged app to make a real
+# bridge request and inspects what comes back.
+#
+# ★★ IT DELIBERATELY DOES NOT NEED TWS, IBKR CREDENTIALS, OR A CONNECTOR.
+# A missing Connector answers "not reachable", which is a PASS -- the request
+# got past the allowlist and out to the network. A path the allowlist refuses
+# answers "rejected by the desktop whitelist", which is the FAILURE this job
+# exists to catch. The two are distinguishable, so no broker is required.
+
+on:
+  workflow_dispatch:
+    inputs:
+      exe_url:
+        description: "Direct URL of the installer to test"
+        default: "https://github.com/none298-dotcom/MyLinedChart-installers/releases/download/latest/MyLinedChart-Windows-Setup.exe"
+        required: false
+      runner:
+        description: "Runner image"
+        default: "windows-2025"
+        required: false
+
+jobs:
+  bridge-paths:
+    runs-on: ${{ inputs.runner || 'windows-2025' }}
+    steps:
+      - name: Download the installer
+        shell: pwsh
+        run: |
+          $url = "${{ inputs.exe_url }}"
+          if (-not $url) { $url = "https://github.com/none298-dotcom/MyLinedChart-installers/releases/download/latest/MyLinedChart-Windows-Setup.exe" }
+          Write-Host "Downloading $url"
+          Invoke-WebRequest -Uri $url -OutFile setup.exe -UseBasicParsing
+          "size: $((Get-Item setup.exe).Length)"
+
+      - name: Silent install
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath .\setup.exe -ArgumentList '/S' -PassThru -Wait
+          Write-Host "installer exit code: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { throw "Silent install failed with exit code $($p.ExitCode)" }
+
+      - name: Locate the installed binary
+        id: locate
+        shell: pwsh
+        run: |
+          $candidates = @(
+            "$env:ProgramFiles\MyLinedChart\MyLinedChart.exe",
+            "${env:ProgramFiles(x86)}\MyLinedChart\MyLinedChart.exe",
+            "$env:LOCALAPPDATA\Programs\MyLinedChart\MyLinedChart.exe"
+          )
+          $exe = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $exe) { Write-Host "::error::installed binary not found"; exit 1 }
+          Write-Host "installed binary: $exe"
+          "exe=$exe" >> $env:GITHUB_OUTPUT
+
+      # ⚠ main.js refuses a bridge request outright when no token file exists
+      # ("Connector token unavailable"), which would mask the very thing this
+      # job measures. Writing one makes the request proceed as far as the
+      # allowlist, which is where the answer lives.
+      - name: Give the app a bridge token so requests reach the allowlist
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:APPDATA 'MyLinedChart\IBKRConnector'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $tok = @{ updatedAt = (Get-Date).ToString('o'); token = 'ci-smoke-token' } | ConvertTo-Json -Compress
+          Set-Content -Path (Join-Path $dir 'bridge-token.json') -Value $tok -NoNewline
+          Write-Host "wrote $(Join-Path $dir 'bridge-token.json')"
+
+      - name: Ask the packaged app to make a real bridge request for each path
+        id: probe
+        shell: pwsh
+        run: |
+          $exe = "${{ steps.locate.outputs.exe }}"
+          $out = Join-Path $PWD 'app-stdout.log'
+          $err = Join-Path $PWD 'app-stderr.log'
+          $env:ELECTRON_ENABLE_LOGGING = "1"
+          $p = Start-Process -FilePath $exe -ArgumentList '--remote-debugging-port=9222' -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+          Start-Sleep -Seconds 40
+          if ($p.HasExited) { Write-Host "::error::the app exited before it could be driven"; exit 1 }
+
+          Add-Type -AssemblyName System.Net.Http
+          $http = New-Object System.Net.Http.HttpClient
+          $wsUrl = $null
+          for ($i = 0; $i -lt 30; $i++) {
+            try {
+              $targets = $http.GetStringAsync('http://127.0.0.1:9222/json').GetAwaiter().GetResult() | ConvertFrom-Json
+              $page = $targets | Where-Object { $_.type -eq 'page' -and $_.webSocketDebuggerUrl } | Select-Object -First 1
+              if ($page) { $wsUrl = $page.webSocketDebuggerUrl; break }
+            } catch { }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $wsUrl) { Write-Host "::error::DevTools never listed a page target"; exit 1 }
+          Write-Host "CDP target: $wsUrl"
+
+          $ws = New-Object System.Net.WebSockets.ClientWebSocket
+          $ws.ConnectAsync([Uri]$wsUrl, [Threading.CancellationToken]::None).GetAwaiter().GetResult()
+          $msgId = 0
+          function Invoke-Cdp([string]$expression) {
+            $script:msgId++
+            $payload = @{ id = $script:msgId; method = 'Runtime.evaluate'; params = @{ expression = $expression; returnByValue = $true; awaitPromise = $true } } | ConvertTo-Json -Depth 8 -Compress
+            $bytes = [Text.Encoding]::UTF8.GetBytes($payload)
+            $seg = New-Object System.ArraySegment[byte] (,$bytes)
+            $ws.SendAsync($seg, 'Text', $true, [Threading.CancellationToken]::None).GetAwaiter().GetResult() | Out-Null
+            $buf = New-Object byte[] 262144
+            $sb = New-Object Text.StringBuilder
+            do {
+              $rseg = New-Object System.ArraySegment[byte] (,$buf)
+              $r = $ws.ReceiveAsync($rseg, [Threading.CancellationToken]::None).GetAwaiter().GetResult()
+              [void]$sb.Append([Text.Encoding]::UTF8.GetString($buf, 0, $r.Count))
+            } while (-not $r.EndOfMessage)
+            return $sb.ToString()
+          }
+
+          # Install a recorder for the response envelope main.js delivers via
+          # window.__mlcDesktopConnectorReceive, without disturbing the chart's
+          # own handler.
+          $recorder = "(() => { window.__mlcProbe = {}; const prev = window.__mlcDesktopConnectorReceive; window.__mlcDesktopConnectorReceive = (env) => { try { if (env && typeof env.requestId === 'string' && env.requestId.indexOf('mlc-probe-') === 0) { window.__mlcProbe[env.requestId] = env; } } catch (e) {} if (typeof prev === 'function') { try { prev(env); } catch (e) {} } }; return 'recorder installed'; })()"
+          Invoke-Cdp $recorder | Out-Null
+
+          # /search is the path this job was written for. /candles is a control:
+          # it has always been allowlisted, so if BOTH come back rejected the
+          # fault is this harness, not the allowlist.
+          $paths = @('/search?q=BHP', '/candles?symbol=SPY')
+          $results = @{}
+          foreach ($path in $paths) {
+            $id = 'mlc-probe-' + ([guid]::NewGuid().ToString('N').Substring(0,8))
+            $expr = "(() => { window.webkit.messageHandlers.app.postMessage({ action: 'ibkrConnectorNative', nativeAction: 'bridgeRequest', requestId: '$id', payload: { path: '$path', method: 'GET', timeoutMs: 4000 } }); return 'posted'; })()"
+            Invoke-Cdp $expr | Out-Null
+            $env_json = $null
+            for ($i = 0; $i -lt 20; $i++) {
+              Start-Sleep -Milliseconds 700
+              $raw = Invoke-Cdp "JSON.stringify(window.__mlcProbe['$id'] || null)"
+              $parsed = $raw | ConvertFrom-Json
+              $val = $parsed.result.result.value
+              if ($val -and $val -ne 'null') { $env_json = $val; break }
+            }
+            if (-not $env_json) {
+              Write-Host "::error::no response envelope for $path within 14s - the message never reached main.js"
+              $results[$path] = 'NO_RESPONSE'
+              continue
+            }
+            Write-Host "$path -> $env_json"
+            $results[$path] = $env_json
+          }
+
+          $ws.Dispose()
+          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+
+          # ★ THE ASSERTION. "Not reachable" is a PASS: the request cleared the
+          # allowlist and went to the network, and no Connector runs here.
+          # "rejected by the desktop whitelist" is the failure -- that string is
+          # produced ONLY by IBKR_BRIDGE_ALLOWED_PATHS refusing the path.
+          $failed = $false
+          foreach ($path in $paths) {
+            $body = [string]$results[$path]
+            if ($body -eq 'NO_RESPONSE') { $failed = $true; continue }
+            if ($body -match 'rejected by the desktop whitelist') {
+              Write-Host "::error::$path was REFUSED by IBKR_BRIDGE_ALLOWED_PATHS in windows-app/main.js. The route is unreachable on Windows no matter what the bridge supports."
+              $failed = $true
+            } else {
+              Write-Host "OK: $path cleared the Windows allowlist"
+            }
+          }
+          Write-Host "----- stdout -----"; if (Test-Path $out) { Get-Content $out }
+          if ($failed) { exit 1 }
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-bridge-paths
+          path: |
+            app-stdout.log
+            app-stderr.log
+          if-no-files-found: warn
+          retention-days: 14
