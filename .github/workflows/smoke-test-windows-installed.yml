@@ -77,8 +77,10 @@ jobs:
 
       - name: Download the installer
         shell: pwsh
+        env:
+          EXE_URL: ${{ inputs.exe_url }}
         run: |
-          $url = "${{ inputs.exe_url }}"
+          $url = $env:EXE_URL
           Write-Host "Downloading $url"
           Invoke-WebRequest -Uri $url -OutFile setup.exe -UseBasicParsing
           $f = Get-Item setup.exe
@@ -193,9 +195,12 @@ jobs:
 
       - name: Launch the INSTALLED app and prove it stays alive
         shell: pwsh
+        env:
+          INSTALLED_EXE: ${{ steps.locate.outputs.exe }}
+          WAIT_SECONDS: ${{ inputs.wait_seconds }}
         run: |
-          $exe = "${{ steps.locate.outputs.exe }}"
-          $wait = [int]"${{ inputs.wait_seconds }}"
+          $exe = $env:INSTALLED_EXE
+          $wait = [int]$env:WAIT_SECONDS
           $out = Join-Path $PWD 'installed-stdout.log'
           $err = Join-Path $PWD 'installed-stderr.log'
           # ELECTRON_ENABLE_LOGGING surfaces renderer console output on stderr,

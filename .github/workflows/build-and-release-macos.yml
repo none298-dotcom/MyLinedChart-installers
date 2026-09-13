@@ -118,9 +118,10 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           set -euo pipefail
-          tag="${{ inputs.release_tag }}"
+          tag="$RELEASE_TAG"
           dmg="${{ steps.pkg.outputs.dmg }}"
           # create the release if the tag doesn't exist yet, else just (re)upload the asset
           gh release create "$tag" "$dmg" \
