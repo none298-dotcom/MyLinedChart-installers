@@ -22,21 +22,17 @@ on:
         description: "Release tag to publish the .exe under. 'latest' is what the WEBSITE links to — do not change it without changing the site too."
         default: "latest"
         required: true
-
-permissions:
-  contents: write        # create/update the Release on this public repo
-  id-token: write        # OIDC token for Azure Trusted Signing (no stored secret)
+# ★ Security audit 2026-09-13 (SUPPLY-CHAIN-CI-01): permissions are granted per JOB, not to the
+# whole run. `npm ci` and electron-builder execute third-party code, so the build job gets read-only
+# contents and no OIDC token. Only the sign job can mint an Azure signing token, and only the publish
+# job can write a Release. A compromised dependency in the build can no longer sign or publish.
+permissions: {}
 
 jobs:
   build:
     runs-on: windows-latest
-    # `secrets` is NOT a valid context in a step-level `if:` (GitHub rejects the
-    # whole workflow with "Unrecognized named-value: 'secrets'"). Surfacing it as
-    # a job env var is the supported way to let a step ask "is signing configured
-    # here?" — which keeps the build working in a fork that has no Azure access.
-    env:
-      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+    permissions:
+      contents: read
     steps:
       - name: Checkout PRIVATE source repo
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -124,6 +120,32 @@ jobs:
           echo "exe=$out" >> "$GITHUB_OUTPUT"
           echo "Built: $out"
 
+      - name: Hand the unsigned installer to the sign job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: unsigned-installer
+          path: |
+            windows-app/dist/MyLinedChart-Windows-Setup.exe
+            windows-app/dist/latest.yml
+          if-no-files-found: error
+          retention-days: 1
+
+  sign:
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      id-token: write        # OIDC token for Azure Trusted Signing (no stored secret)
+    # `secrets` is not valid in a step-level `if:`; a job env var lets a step ask whether signing is configured.
+    env:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+    steps:
+      - name: Receive the unsigned installer
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: unsigned-installer
+          path: windows-app/dist
+
       # ★ Authenticode-sign with Azure Trusted Signing.
       # Signs with the SHORT-LIVED cert Azure mints per run under the
       # mlc-public-trust profile -- nothing to install, renew or store here.
@@ -178,7 +200,7 @@ jobs:
       - name: Re-hash latest.yml against the SIGNED installer
         shell: pwsh
         run: |
-          $exe = "${{ steps.pkg.outputs.exe }}"
+          $exe = "windows-app/dist/MyLinedChart-Windows-Setup.exe"
           $yml = "windows-app/dist/latest.yml"
           $bytes = [System.IO.File]::ReadAllBytes($exe)
           $sha = [Convert]::ToBase64String([System.Security.Cryptography.SHA512]::Create().ComputeHash($bytes))
@@ -194,7 +216,7 @@ jobs:
       - name: Verify the signature landed
         shell: pwsh
         run: |
-          $exe = "${{ steps.pkg.outputs.exe }}"
+          $exe = "windows-app/dist/MyLinedChart-Windows-Setup.exe"
           $sig = Get-AuthenticodeSignature $exe
           Write-Host "Status : $($sig.Status)"
           Write-Host "Signer : $($sig.SignerCertificate.Subject)"
@@ -207,13 +229,27 @@ jobs:
             exit 1
           }
 
-      - name: Upload as run artifact (fallback / debugging)
+      - name: Hand the SIGNED installer to the publish job (also kept as a run artifact)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: MyLinedChart-Windows-Setup
-          path: ${{ steps.pkg.outputs.exe }}
+          path: |
+            windows-app/dist/MyLinedChart-Windows-Setup.exe
+            windows-app/dist/latest.yml
           if-no-files-found: error
           retention-days: 30
+
+  publish:
+    needs: sign
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # create/update the Release on this public repo
+    steps:
+      - name: Receive the signed installer
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: MyLinedChart-Windows-Setup
+          path: dist
 
       - name: Publish to public Release
         shell: bash
@@ -221,9 +257,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="${{ inputs.release_tag }}"
-          exe="${{ steps.pkg.outputs.exe }}"
+          exe="dist/MyLinedChart-Windows-Setup.exe"
           # create the release if the tag doesn't exist yet, else just (re)upload the asset
-          yml="windows-app/dist/latest.yml"
+          yml="dist/latest.yml"
           # latest.yml IS the update feed. Publishing the .exe without it means
           # no installed app ever learns a new version exists.
           gh release create "$tag" "$exe" "$yml" \
