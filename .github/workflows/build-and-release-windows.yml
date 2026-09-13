@@ -198,8 +198,13 @@ jobs:
           $sig = Get-AuthenticodeSignature $exe
           Write-Host "Status : $($sig.Status)"
           Write-Host "Signer : $($sig.SignerCertificate.Subject)"
+          # ★ Security audit 2026-09-13 (SUPPLY-CHAIN-CI-04): this was a warning, and the
+          # publish step below still ran, so an unsigned installer could overwrite
+          # `latest` and reach every Windows install through electron-updater. An
+          # installer that is not validly signed now stops the job before publishing.
           if ($sig.Status -ne 'Valid') {
-            Write-Host "::warning::Installer is NOT validly signed ($($sig.Status)) - it will trigger SmartScreen."
+            Write-Host "::error::Installer is NOT validly signed ($($sig.Status)); refusing to publish."
+            exit 1
           }
 
       - name: Upload as run artifact (fallback / debugging)
