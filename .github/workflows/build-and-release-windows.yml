@@ -255,8 +255,11 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          # Inputs reach the shell as environment variables, never pasted into the script
+          # (security audit 2026-09-13, SUPPLY-CHAIN-CI-05).
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
-          tag="${{ inputs.release_tag }}"
+          tag="$RELEASE_TAG"
           exe="dist/MyLinedChart-Windows-Setup.exe"
           # create the release if the tag doesn't exist yet, else just (re)upload the asset
           yml="dist/latest.yml"

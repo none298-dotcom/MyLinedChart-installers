@@ -44,8 +44,10 @@ jobs:
     steps:
       - name: Download the installer
         shell: pwsh
+        env:
+          EXE_URL: ${{ inputs.exe_url }}
         run: |
-          $url = "${{ inputs.exe_url }}"
+          $url = $env:EXE_URL
           if (-not $url) { $url = "https://github.com/none298-dotcom/MyLinedChart-installers/releases/download/latest/MyLinedChart-Windows-Setup.exe" }
           Write-Host "Downloading $url"
           Invoke-WebRequest -Uri $url -OutFile setup.exe -UseBasicParsing
