@@ -36,11 +36,20 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Install dependencies
         working-directory: windows-app
         run: npm ci
+
+      # Electron 42+ stopped downloading its binary in the npm postinstall; this test
+      # launches node_modules\electron\dist\electron.exe directly, so fetch it
+      # explicitly. Guarded so older Electron (which still downloads on install) is a no-op.
+      - name: Install the Electron binary (Electron 42+)
+        working-directory: windows-app
+        shell: pwsh
+        run: |
+          if (Test-Path node_modules\.bin\install-electron.cmd) { npx install-electron --no } else { Write-Host "electron postinstall already fetched the binary" }
 
       # Syntax gate first: a parse error would otherwise show up as a confusing
       # "app exited immediately" below.
