@@ -480,3 +480,4 @@ jobs:
           Partner Center any more -- see windows/Package/AppxManifest.xml's header for why a sparse
           package never needed it in the first place.
           "@
+# re-run: real Trusted Signing wiring + identity fix (e55925b4)
