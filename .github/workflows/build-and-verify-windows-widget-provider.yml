@@ -437,3 +437,4 @@ jobs:
           SAME certificate as the main app installer, open the Widgets Board, add the watchlist
           widget, and look.
           "@
+# re-run: source repo pushed the makeappx placeholder fix (1f34db10)
