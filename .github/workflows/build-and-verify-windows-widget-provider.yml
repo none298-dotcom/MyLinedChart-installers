@@ -56,6 +56,20 @@ on:
         description: "Private-repo branch/tag/SHA to build from"
         default: "windows-watchlist-widget"
         required: true
+  # ★ workflow_dispatch alone cannot be run until this file lands on the
+  # DEFAULT branch (GitHub only lists/dispatches workflow_dispatch workflows
+  # that already exist there — confirmed here by an actual 404 from
+  # `gh workflow run` against this exact file on its own PR branch). This
+  # repo's own PR for this file cannot be merged yet (companion source-repo
+  # PR is still open, unreviewed, not to be merged either) but still needs a
+  # real run to prove anything — pull_request does not have that
+  # restriction: GitHub runs a workflow added BY a same-repo PR using that
+  # PR branch's own copy of the file. Once this PR is closed either way,
+  # workflow_dispatch is what future manual runs should use.
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/build-and-verify-windows-widget-provider.yml"
 
 permissions:
   contents: read
@@ -74,7 +88,11 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: none298-dotcom/MyLinedChart
-          ref: ${{ inputs.ref }}
+          # inputs.ref is only set for workflow_dispatch; a pull_request run
+          # (see the trigger's own comment above, for why this file needs
+          # that too) falls back to the branch this widget work actually
+          # lives on.
+          ref: ${{ inputs.ref || 'windows-watchlist-widget' }}
           token: ${{ secrets.PRIVATE_REPO_TOKEN }}
 
       - name: Setup .NET (pinned by windows/WidgetProvider/global.json)
