@@ -62,17 +62,10 @@ name: Build & Release Windows Store EXE
 # mechanism, two keys. Once this lands, point Partner Center's "EXE or MSI
 # app" package URL at the new R2 url instead of the website's — that is the
 # actual fix for both certification findings; this workflow only produces
-# the file and publishes it to where that URL needs to point.
+# the file; the release operator uploads it to R2 locally (no storage credentials in this public repo).
 #
-# ONE-TIME SETUP (repo secrets, public installers repo):
-#   Already present (reused from build-and-release-windows.yml):
-#     PRIVATE_REPO_TOKEN, AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
-#   NEW, needed for this workflow's `publish` job:
-#     R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY
-#     (Cloudflare dashboard > R2 > Manage R2 API Tokens > Object Read & Write,
-#     scoped to the mylinedchart-downloads bucket — same credential shape as
-#     ~/.mlc-r2.env for a local run of scripts/upload-installer-to-r2.sh, see
-#     that script's header.)
+# Secrets used (already present, shared with build-and-release-windows.yml):
+#   PRIVATE_REPO_TOKEN, AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
 
 on:
   workflow_dispatch:
