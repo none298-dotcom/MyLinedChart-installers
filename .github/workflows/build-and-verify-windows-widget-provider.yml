@@ -55,6 +55,24 @@ name: Build & verify Windows Widgets Board provider
 # kept here so the widget-specific proof steps (Get-AppxPackageManifest
 # inspection, the full install/uninstall round trip) stay independently
 # runnable without waiting on a full release build.
+#
+# ★★ CONFIRMED ON REAL CI: the real signing certificate CANNOT be exercised
+# from any branch other than main, by design, regardless of trigger. Tried
+# both ways before writing the fallback below:
+#   - pull_request (run 35425060976): OIDC subject
+#     "repo:.../MyLinedChart-installers:pull_request" -> AADSTS700213.
+#   - workflow_dispatch from this very branch (run 35426077385): OIDC subject
+#     "repo:.../MyLinedChart-installers:ref:refs/heads/add-windows-widget-provider-ci"
+#     -> the SAME AADSTS700213. build-and-release-windows.yml's own `sign` job
+#     has a long green history, but every one of those runs dispatched from
+#     `main` -- the federated identity credential is scoped to that ref, which
+#     is a correct security boundary (a feature branch must not be able to
+#     mint a production code-signing token) and not something to widen from
+#     inside a workflow file. The azure_login step below is
+#     `continue-on-error: true` specifically so this run still proves the
+#     entire mechanical flow via the CI-only fallback certificate; the real
+#     certificate will sign for real the moment this runs via
+#     workflow_dispatch from `main` after merge.
 
 on:
   workflow_dispatch:
@@ -549,4 +567,3 @@ jobs:
           Partner Center any more -- see windows/Package/AppxManifest.xml's header for why a sparse
           package never needed it in the first place.
           "@
-# re-run: real Trusted Signing wiring + identity fix (e55925b4)
