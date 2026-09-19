@@ -1,0 +1,385 @@
+name: Build & Release Windows Store EXE
+
+# ★★ THIS FILE LIVES IN THE PUBLIC MyLinedChart-installers REPO, NOT HERE.
+#
+# Copy it to .github/workflows/build-windows-store-exe.yml in
+# none298-dotcom/MyLinedChart-installers (same repo/layout as
+# build-and-release-windows.yml and build-windows-msix.yml, which this file
+# was modeled on almost line for line — see those two for the conventions
+# this reuses). This repo's own agent cannot push there.
+#
+# WHY A THIRD WINDOWS WORKFLOW
+# Microsoft certification (report 2026-09-15) failed the Partner Center
+# "EXE or MSI app" listing, which links straight to the SAME .exe
+# build-and-release-windows.yml publishes — the ordinary direct-download
+# installer, unaware it was running under Store review:
+#   10.2.10.1 Security             — the app initiates downloads of other
+#                                     apps/files that execute code
+#                                     (electron-updater + the bundled
+#                                     Connector).
+#   10.1.5 Software Distribution   — the demo tour's step 1 promotes
+#                                     acquiring the AI connector outside the
+#                                     Store ("Install the AI connector" ->
+#                                     "Download and install").
+#
+# windows-app/electron-builder.store-exe.yml (see that file's own header)
+# builds a SEPARATE NSIS .exe from the identical source that ships a
+# `store-edition.json` marker resource. windows-app/preload.js and main.js
+# read that marker to declare __MLC_EDITION__ = { sandboxed:true,
+# connectorAvailable:false, externalAgentsAvailable:false, store:true,
+# platform:'windows' } — the same shape the sandboxed Mac App Store build
+# already uses — which the shared chart bundle uses to hide the Connector,
+# the .mcpb/external-agent download UI and the tour's connector step, and
+# which main.js additionally uses to skip electron-updater and the Connector
+# spawn entirely (see windows-app/main.js's IS_STORE_EDITION).
+#
+# ★ PLATFORM PARITY: the Windows 11 Widgets Board provider is NOT excluded
+# from this edition. It is a first-party sparse package this SAME installer
+# registers at install time (Add-AppxPackage -ExternalLocation against files
+# the installer already placed on disk) — not "other software" in the
+# 10.1.5/10.2.10.1 sense. See electron-builder.store-exe.yml's own header for
+# the full reasoning. That means this workflow needs the SAME
+# build-widget-provider job as build-and-release-windows.yml, duplicated
+# below rather than shared (this repo has no reusable-workflow convention
+# yet) — best-effort, exactly as it is for the direct build: a widget-
+# provider regression must never block shipping this edition.
+#
+# ★ THIS IS NOT build-windows-msix.yml. That workflow builds an appx/MSIX
+# package (a different Partner Center product, never submitted — its
+# identityName/publisher are still TODO in electron-builder.store.yml) and is
+# uploaded as a run artifact because MSIX submission works by uploading the
+# package directly in Partner Center. The "EXE or MSI app" listing type
+# instead needs a public, DIRECT, VERSIONED, IMMUTABLE URL — a redirecting
+# GitHub release URL is rejected outright (this is WHY the direct-download
+# installer moved off GitHub releases to R2 in the first place, see
+# scripts/upload-installer-to-r2.sh's own header and memory
+# windows-store-ships-a-different-file.md / downloads-hosting-use-r2.md). So
+# this workflow signs the .exe and publishes it to Cloudflare R2, at
+#   windows/<version>/store/MyLinedChart-Windows-Store-Setup.exe
+# via the SAME script and the SAME overwrite-refusal rule the direct build's
+# release process already uses for its own R2 path
+# (windows/<version>/MyLinedChart-Windows-Setup.exe) — one script, one
+# mechanism, two keys. Once this lands, point Partner Center's "EXE or MSI
+# app" package URL at the new R2 url instead of the website's — that is the
+# actual fix for both certification findings; this workflow only produces
+# the file and publishes it to where that URL needs to point.
+#
+# ONE-TIME SETUP (repo secrets, public installers repo):
+#   Already present (reused from build-and-release-windows.yml):
+#     PRIVATE_REPO_TOKEN, AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
+#   NEW, needed for this workflow's `publish` job:
+#     R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY
+#     (Cloudflare dashboard > R2 > Manage R2 API Tokens > Object Read & Write,
+#     scoped to the mylinedchart-downloads bucket — same credential shape as
+#     ~/.mlc-r2.env for a local run of scripts/upload-installer-to-r2.sh, see
+#     that script's header.)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Private-repo branch/tag/SHA to build from"
+        default: "main"
+        required: true
+
+# Same per-job least-privilege split as build-and-release-windows.yml
+# (security audit 2026-09-13, SUPPLY-CHAIN-CI-01): the job that runs `npm ci`
+# and electron-builder (third-party code) gets read-only contents and no
+# OIDC token; only `sign` can mint an Azure signing token; `publish` holds
+# the R2 credentials and nothing else.
+permissions: {}
+
+jobs:
+  # ★ Windows 11 Widgets Board provider — BEST-EFFORT, ISOLATED JOB. Verbatim
+  # copy of build-and-release-windows.yml's own job of the same name (see
+  # that workflow for the fuller design comment); duplicated rather than
+  # shared because this repo has no reusable-workflow setup yet.
+  # `continue-on-error: true` is load-bearing: a widget-provider regression
+  # must never block shipping the Store edition, exactly as it must never
+  # block the direct one.
+  build-widget-provider:
+    runs-on: windows-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+      id-token: write   # Azure OIDC federated login for Trusted Signing -- no stored secret
+    env:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+    outputs:
+      built: ${{ steps.status.outputs.built }}
+    steps:
+      - name: Checkout PRIVATE source repo
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: none298-dotcom/MyLinedChart
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+
+      - name: Setup .NET (pinned by windows/WidgetProvider/global.json)
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@30375c66a4eea26614e0d39710365f22f8b0af57 # v3.0.0
+
+      - name: Locate Windows SDK tools (makeappx, signtool)
+        id: sdktools
+        shell: pwsh
+        run: |
+          $sdkRoot = "C:\Program Files (x86)\Windows Kits\10\bin"
+          $makeappx = Get-ChildItem $sdkRoot -Recurse -Filter "makeappx.exe" -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -like "*\x64\*" } | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $makeappx) { throw "makeappx.exe not found under $sdkRoot" }
+          "makeappx=$($makeappx.FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Restore + publish the widget provider
+        shell: pwsh
+        run: |
+          msbuild windows\WidgetProvider\MyLinedChartWidgetProvider.csproj `
+            /restore /t:Publish /p:Configuration=Release `
+            /p:PublishDir=$PWD\windows\WidgetProvider\publish\ `
+            /nologo /v:minimal
+          if ($LASTEXITCODE -ne 0) { throw "msbuild failed with exit code $LASTEXITCODE" }
+          if (-not (Test-Path "windows\WidgetProvider\publish\MyLinedChartWidgetProvider.exe")) { throw "publish did not produce the provider exe" }
+
+      - name: Azure login (federated / OIDC)
+        if: ${{ env.AZURE_CLIENT_ID != '' }}
+        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign the widget provider exe (Azure Trusted Signing, same cert as the main app)
+        if: ${{ env.AZURE_CLIENT_ID != '' }}
+        uses: azure/trusted-signing-action@1d365fec12862c4aa68fcac418143d73f0cea293 # v0
+        with:
+          azure-tenant-id: ${{ env.AZURE_TENANT_ID }}
+          azure-client-id: ${{ env.AZURE_CLIENT_ID }}
+          endpoint: https://eus.codesigning.azure.net/
+          trusted-signing-account-name: mlcsigning
+          certificate-profile-name: mlc-public-trust
+          files: ${{ github.workspace }}\windows\WidgetProvider\publish\MyLinedChartWidgetProvider.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Stamp AppxManifest.xml (Version from the app, Publisher from the real cert)
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature windows\WidgetProvider\publish\MyLinedChartWidgetProvider.exe
+          if ($sig.Status -ne 'Valid') { throw "Provider exe is not validly signed ($($sig.Status))" }
+          node windows\Package\scripts\stamp-appx-identity.cjs --manifest windows\Package\AppxManifest.xml --publisher $sig.SignerCertificate.Subject
+          if ($LASTEXITCODE -ne 0) { throw "stamp-appx-identity.cjs failed with exit code $LASTEXITCODE" }
+
+      - name: Pack the sparse MSIX
+        shell: pwsh
+        env:
+          MAKEAPPX: ${{ steps.sdktools.outputs.makeappx }}
+        run: |
+          New-Item -ItemType Directory -Path windows\Package\dist -Force | Out-Null
+          & $env:MAKEAPPX pack /d windows\Package /p windows\Package\dist\MyLinedChartWidgets.msix /o
+          if ($LASTEXITCODE -ne 0) { throw "makeappx pack failed with exit code $LASTEXITCODE" }
+
+      - name: Sign the sparse MSIX (Azure Trusted Signing, same cert as the main app)
+        if: ${{ env.AZURE_CLIENT_ID != '' }}
+        uses: azure/trusted-signing-action@1d365fec12862c4aa68fcac418143d73f0cea293 # v0
+        with:
+          azure-tenant-id: ${{ env.AZURE_TENANT_ID }}
+          azure-client-id: ${{ env.AZURE_CLIENT_ID }}
+          endpoint: https://eus.codesigning.azure.net/
+          trusted-signing-account-name: mlcsigning
+          certificate-profile-name: mlc-public-trust
+          files: ${{ github.workspace }}\windows\Package\dist\MyLinedChartWidgets.msix
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Verify both signatures landed, then mark this job's output built
+        id: status
+        shell: pwsh
+        run: |
+          $exeSig = Get-AuthenticodeSignature windows\WidgetProvider\publish\MyLinedChartWidgetProvider.exe
+          $msixSig = Get-AuthenticodeSignature windows\Package\dist\MyLinedChartWidgets.msix
+          if ($exeSig.Status -ne 'Valid' -or $msixSig.Status -ne 'Valid') {
+            throw "Provider exe signature: $($exeSig.Status); sparse MSIX signature: $($msixSig.Status) -- refusing to ship an unsigned/invalid widget provider."
+          }
+          "built=true" >> $env:GITHUB_OUTPUT
+          Write-Host "Widget provider built and signed."
+
+      - name: Upload the signed widget provider bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: widget-provider-bundle-store
+          path: |
+            windows/WidgetProvider/publish/**
+            windows/Package/dist/MyLinedChartWidgets.msix
+          if-no-files-found: error
+          retention-days: 1
+
+  build:
+    needs: build-widget-provider
+    # Must run even if build-widget-provider failed outright (its own
+    # continue-on-error: true keeps the WORKFLOW from failing over it, but a
+    # job's default `if` still gates on its needs succeeding) — a widget-
+    # provider regression must never block shipping the main desktop app.
+    if: ${{ !cancelled() }}
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.pkg.outputs.version }}
+    steps:
+      - name: Checkout PRIVATE source repo
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: none298-dotcom/MyLinedChart
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+
+      # Best-effort per build-widget-provider's own header: only fetched
+      # when that job actually succeeded. windows-app/scripts/
+      # stage-widget-provider.js (run by predist:win:store-exe, below) looks
+      # for these exact paths and quietly ships without a widget provider if
+      # either is missing — see that script's own comment.
+      - name: Fetch the signed widget provider (best-effort)
+        if: ${{ needs.build-widget-provider.outputs.built == 'true' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: widget-provider-bundle-store
+          path: windows
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: windows-app/package-lock.json
+
+      - name: Install dependencies
+        working-directory: windows-app
+        run: npm ci
+
+      # ★ NO Connector fetch step here, unlike build-and-release-windows.yml.
+      # electron-builder.store-exe.yml never references build/connector/ in
+      # extraResources (connectorAvailable is false for this edition), so
+      # there is nothing for this build to stage — see that file's header.
+      # The Widgets Board provider fetched above IS staged, via the same
+      # predist:win:store-exe hook that stamps store-edition.json.
+
+      - name: Build Store NSIS installer (.exe)
+        working-directory: windows-app
+        # predist:win:store-exe (npm's automatic pre-hook) stamps
+        # build/store-edition.json AND stages the widget provider before
+        # electron-builder runs — see windows-app/scripts/
+        # write-store-edition-flag.js and stage-widget-provider.js.
+        run: npm run dist:win:store-exe
+        env:
+          # Same reasoning as the direct build: package unsigned here, sign
+          # in the dedicated `sign` job below so a signing failure can never
+          # corrupt the package.
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+
+      - name: Locate the installer
+        id: pkg
+        shell: bash
+        run: |
+          out="windows-app/dist-store-exe/MyLinedChart-Windows-Store-Setup.exe"
+          test -f "$out" || { echo "expected $out from electron-builder"; ls -la windows-app/dist-store-exe; exit 1; }
+          version="$(node -p "require('./windows-app/package.json').version")"
+          echo "exe=$out" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Built: $out (version $version)"
+
+      - name: Hand the unsigned installer to the sign job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: unsigned-store-installer
+          path: windows-app/dist-store-exe/MyLinedChart-Windows-Store-Setup.exe
+          if-no-files-found: error
+          retention-days: 1
+
+  sign:
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      id-token: write        # OIDC token for Azure Trusted Signing (no stored secret)
+    env:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+    steps:
+      - name: Receive the unsigned installer
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: unsigned-store-installer
+          path: windows-app/dist-store-exe
+
+      - name: Azure login (federated / OIDC)
+        if: ${{ env.AZURE_CLIENT_ID != '' }}
+        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # Same cert/profile as the direct .exe and the widget provider — one
+      # Azure Trusted Signing account signs every Windows binary this project
+      # ships. A Store-review installer with no valid Authenticode signature
+      # would trip SmartScreen just like an unsigned direct download would.
+      - name: Sign installer (Azure Trusted Signing)
+        id: sign
+        if: ${{ env.AZURE_CLIENT_ID != '' }}
+        uses: azure/trusted-signing-action@1d365fec12862c4aa68fcac418143d73f0cea293 # v0
+        with:
+          azure-tenant-id: ${{ env.AZURE_TENANT_ID }}
+          azure-client-id: ${{ env.AZURE_CLIENT_ID }}
+          endpoint: https://eus.codesigning.azure.net/
+          trusted-signing-account-name: mlcsigning
+          certificate-profile-name: mlc-public-trust
+          files: ${{ github.workspace }}\windows-app\dist-store-exe\MyLinedChart-Windows-Store-Setup.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      # ★ No latest.yml re-hash step here, unlike build-and-release-windows.yml.
+      # This edition ships no publish: feed (electron-builder.store-exe.yml
+      # never configures one) and main.js's IS_STORE_EDITION gate never calls
+      # electron-updater, so electron-builder never generates a latest.yml/
+      # blockmap for this artifact to invalidate.
+
+      - name: Verify the signature landed
+        shell: pwsh
+        run: |
+          $exe = "windows-app/dist-store-exe/MyLinedChart-Windows-Store-Setup.exe"
+          $sig = Get-AuthenticodeSignature $exe
+          Write-Host "Status : $($sig.Status)"
+          Write-Host "Signer : $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') {
+            Write-Host "::error::Installer is NOT validly signed ($($sig.Status)); refusing to publish."
+            exit 1
+          }
+
+      - name: Hand the SIGNED installer to the publish job (also kept as a run artifact)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: MyLinedChart-Windows-Store-Setup
+          path: windows-app/dist-store-exe/MyLinedChart-Windows-Store-Setup.exe
+          if-no-files-found: error
+          retention-days: 30
+
+  # ★★ PUBLISHES TO CLOUDFLARE R2, NOT A GITHUB RELEASE.
+  #
+  # Microsoft requires the package URL be DIRECT (no redirect), VERSIONED and
+  # IMMUTABLE. A GitHub release asset URL redirects to a signed, expiring
+  # release-assets.githubusercontent.com link — exactly what the DIRECT
+  # installer moved off of, for the exact same reason (see
+  # scripts/upload-installer-to-r2.sh's header and memory
+  # windows-store-ships-a-different-file.md). This job checks out the
+  # private source repo (for the script + the app version) and calls that
+  # SAME script with `store` as the third argument, so both editions publish
+  # through one mechanism with one overwrite-refusal rule, not two.
+  # No publish job: R2 credentials are never stored in this PUBLIC repo. The signed installer above is kept as the
+  # run artifact "MyLinedChart-Windows-Store-Setup"; the release operator downloads it (gh run download) and uploads it
+  # with scripts/upload-installer-to-r2.sh <version> <exe> store from the private repo, exactly like the direct EXE.

@@ -1,5 +1,25 @@
 name: Smoke test INSTALLED Windows app
 
+# ★★ THIS FILE LIVES IN THE PUBLIC MyLinedChart-installers REPO, NOT HERE.
+#
+# This is the FULL replacement content for
+# .github/workflows/smoke-test-windows-installed.yml there. The only changes
+# from the version already live are the new `is_store_edition` input and the
+# "Assert the Store edition shipped no Connector..." step it gates (search
+# for "is_store_edition" below) — everything else is unchanged. This repo's
+# own agent cannot push to the installers repo.
+#
+# WHY THE CHANGE: this workflow already runs against any exe_url, so it can
+# already test windows-app/electron-builder.store-exe.yml's
+# MyLinedChart-Windows-Store-Setup.exe once it is signed and published (see
+# windows-app/ci/build-windows-store-exe.yml) — pass that build's R2 url as
+# exe_url. What it could NOT do before is prove the shape that build exists
+# for: that the installed Store edition actually shipped with no Connector
+# and the store-edition.json marker preload.js/main.js read to declare
+# __MLC_EDITION__.sandboxed/store. `is_store_edition: true` turns that
+# assertion on; the default (false) leaves every existing run against the
+# direct-download exe byte-for-byte unaffected.
+#
 # ★ WHY THIS EXISTS — Microsoft failed certification on 2026-07-30 with
 # "10.1.2.10 Functionality — The product crashes at launch", while our existing
 # smoke test was green on every build.
@@ -43,7 +63,7 @@ on:
   workflow_dispatch:
     inputs:
       exe_url:
-        description: "Direct URL of the installer to test (defaults to the beta release asset)"
+        description: "Direct URL of the installer to test (defaults to the beta release asset; pass the Store edition's R2 url — dl.littlebirdtrading.com/windows/<ver>/store/MyLinedChart-Windows-Store-Setup.exe — together with is_store_edition: true to test that build)"
         # ★ `latest` is the only release tag now. The "beta" tag was retired on
         # 2026-08-03 because the site downloaded from `latest` while the build
         # workflows published to `beta`, so the site served a stale EXE for two
@@ -61,6 +81,11 @@ on:
         required: false
         type: choice
         options: ["windows-latest", "windows-2022", "windows-2025"]
+      is_store_edition:
+        description: "Set true when exe_url is the Microsoft Store edition (MyLinedChart-Windows-Store-Setup.exe) — asserts no bundled Connector and the store-edition.json marker is present. Leave false for the direct-download exe."
+        default: false
+        required: false
+        type: boolean
 
 permissions:
   contents: read
@@ -192,6 +217,50 @@ jobs:
           $dir = Split-Path $exe -Parent
           Write-Host "--- resources\ (what actually shipped) ---"
           Get-ChildItem (Join-Path $dir 'resources') -ErrorAction SilentlyContinue | Format-Table Name,Length
+
+      # ★★ STORE EDITION ONLY. Proves the one thing that failed certification
+      # 2026-09-15 is actually gone from the installed bytes, not just from the
+      # build config: no bundled Connector (10.2.10.1 — the app initiating
+      # downloads of other executables) and the presence of the
+      # store-edition.json marker that preload.js/main.js read to declare
+      # __MLC_EDITION__ = { sandboxed:true, connectorAvailable:false,
+      # externalAgentsAvailable:false, store:true } — the flags that hide the
+      # Connector/.mcpb download UI and disable electron-updater (see
+      # windows-app/electron-builder.store-exe.yml and main.js's
+      # IS_STORE_EDITION). Skipped entirely (not merely non-fatal) when
+      # testing the direct-download exe, which legitimately DOES ship
+      # resources\connector and no marker — asserting either shape there
+      # would be a false failure, not a stricter check.
+      - name: Assert the Store edition shipped no Connector and carries the store-edition marker
+        if: ${{ inputs.is_store_edition == true }}
+        shell: pwsh
+        env:
+          INSTALLED_EXE: ${{ steps.locate.outputs.exe }}
+        run: |
+          $installedRoot = Split-Path $env:INSTALLED_EXE -Parent
+          $resourcesDir = Join-Path $installedRoot 'resources'
+          $connectorDir = Join-Path $resourcesDir 'connector'
+          $markerFile = Join-Path $resourcesDir 'store-edition.json'
+
+          if (Test-Path $connectorDir) {
+            Write-Host "::error::Store edition must not ship resources\connector — found $connectorDir. This is exactly what certification 10.2.10.1 rejected (the app initiating downloads of other executables)."
+            Get-ChildItem $connectorDir -Recurse -ErrorAction SilentlyContinue | Select-Object -First 20 | Format-Table FullName
+            exit 1
+          }
+          Write-Host "No resources\connector present -- correct for the Store edition."
+
+          if (-not (Test-Path $markerFile)) {
+            Write-Host "::error::Store edition must ship resources\store-edition.json — not found at $markerFile. Without it, preload.js/main.js cannot tell this apart from the direct-download build and every sandboxed-edition gate (Connector UI, .mcpb download, electron-updater) fails OPEN."
+            exit 1
+          }
+          Write-Host "store-edition.json found:"
+          Get-Content $markerFile
+          $marker = Get-Content $markerFile -Raw | ConvertFrom-Json
+          if ($marker.edition -ne 'store') {
+            Write-Host "::error::store-edition.json exists but its edition field is '$($marker.edition)', not 'store'."
+            exit 1
+          }
+          Write-Host "Store edition confirmed: no Connector, store-edition.json present with edition='store'."
 
       # ★ Windows 11 Widgets Board watchlist provider (windows/WidgetProvider/,
       # windows-app/build/installer-widget-provider.nsh's customInstall macro).
