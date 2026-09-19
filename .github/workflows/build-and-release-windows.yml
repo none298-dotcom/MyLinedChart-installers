@@ -194,12 +194,18 @@ jobs:
 
   build:
     needs: build-widget-provider
-    # ★ MUST run even if build-widget-provider failed outright (its own
-    # continue-on-error: true keeps the WORKFLOW from failing over it, but a
-    # job's default `if` still gates on its needs succeeding, and belt-and-
-    # suspenders costs nothing here) -- a widget-provider regression must
-    # never block shipping the main desktop app. See that job's own header.
-    if: ${{ !cancelled() }}
+    # ★ TWO conditions, both load-bearing:
+    #   !cancelled() -- must run even if build-widget-provider failed outright
+    #     (its own continue-on-error: true keeps the WORKFLOW from failing over
+    #     it, but a job's default `if` still gates on its needs succeeding, and
+    #     belt-and-suspenders costs nothing here) -- a widget-provider
+    #     regression must never block shipping the main desktop app.
+    #   github.event_name == 'workflow_dispatch' -- this workflow's own test-only
+    #     pull_request trigger (see the `on:` block's comment) exists ONLY to
+    #     give build-widget-provider a real pre-merge run; build/sign/publish
+    #     must never run, build a real installer, or touch the public Release
+    #     from a pull_request event.
+    if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' }}
     runs-on: windows-latest
     permissions:
       contents: read
