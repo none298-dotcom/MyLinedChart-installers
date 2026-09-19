@@ -22,6 +22,21 @@ on:
         description: "Release tag to publish the .exe under. 'latest' is what the WEBSITE links to — do not change it without changing the site too."
         default: "latest"
         required: true
+  # ★ TEST-ONLY, SCOPED TO build-widget-provider ALONE. workflow_dispatch
+  # cannot be run until this file lands on the default branch (see
+  # build-and-verify-windows-widget-provider.yml's own trigger comment for
+  # the confirmed 404 that motivates this same pattern here), but this file
+  # ships a brand-new job that needs a real run before anyone can trust it.
+  # `build`'s own `if:` below requires `github.event_name ==
+  # 'workflow_dispatch'`, so a pull_request-triggered run executes ONLY
+  # build-widget-provider and skips build/sign/publish entirely -- nothing
+  # here can build the main installer, sign anything with the production
+  # NSIS pipeline, or touch the public Release, no matter what this trigger
+  # fires on.
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/build-and-release-windows.yml"
 # ★ Security audit 2026-09-13 (SUPPLY-CHAIN-CI-01): permissions are granted per JOB, not to the
 # whole run. `npm ci` and electron-builder execute third-party code, so the build job gets read-only
 # contents and no OIDC token. Only the sign job can mint an Azure signing token, and only the publish
@@ -29,7 +44,168 @@ on:
 permissions: {}
 
 jobs:
+  # ★ Windows 11 Widgets Board watchlist provider -- BEST-EFFORT, ISOLATED JOB.
+  #
+  # See the private source repo's windows/README.md and windows/Package/AppxManifest.xml
+  # for the full design. This job builds the small C# COM server
+  # (windows/WidgetProvider/), signs it and the sparse MSIX with the SAME Azure
+  # Trusted Signing certificate that signs the main .exe below, and uploads the
+  # result as an artifact for the `build` job to bundle -- proven end to end
+  # (build, pack, sign, Add-AppxPackage register/deregister, and the same round
+  # trip via a real NSIS install/uninstall) in
+  # build-and-verify-windows-widget-provider.yml.
+  #
+  # `continue-on-error: true` is load-bearing, not decoration: a widget-provider
+  # regression (a Windows App SDK version bump, a signing hiccup, anything) must
+  # NEVER block shipping the main desktop app, which is the whole reason this is
+  # a separate job rather than a step inside `build`. When this job fails, GitHub
+  # still reports its own conclusion as failure in the Actions UI (so a real
+  # regression is visible), but `needs: build-widget-provider` in the `build` job
+  # below proceeds anyway and simply ships without a widget that run -- see that
+  # job's own "Fetch the signed widget provider" step for exactly how it detects
+  # which case it's in.
+  build-widget-provider:
+    runs-on: windows-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+      id-token: write   # Azure OIDC federated login for Trusted Signing -- no stored secret
+    env:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+    outputs:
+      built: ${{ steps.status.outputs.built }}
+    steps:
+      - name: Checkout PRIVATE source repo
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: none298-dotcom/MyLinedChart
+          # inputs.ref is unset on the test-only pull_request trigger (see
+          # this workflow's own `on:` comment) -- falls back to the branch
+          # this widget work actually lives on.
+          ref: ${{ inputs.ref || 'windows-watchlist-widget' }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+
+      - name: Setup .NET (pinned by windows/WidgetProvider/global.json)
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Setup MSBuild
+        # msbuild, NOT `dotnet build` -- see MyLinedChartWidgetProvider.csproj's
+        # own header for why (the Windows App SDK's MRT targets need Visual
+        # Studio's Appx tooling, which the dotnet SDK alone does not carry).
+        uses: microsoft/setup-msbuild@30375c66a4eea26614e0d39710365f22f8b0af57 # v3.0.0
+
+      - name: Locate Windows SDK tools (makeappx, signtool)
+        id: sdktools
+        shell: pwsh
+        run: |
+          $sdkRoot = "C:\Program Files (x86)\Windows Kits\10\bin"
+          $makeappx = Get-ChildItem $sdkRoot -Recurse -Filter "makeappx.exe" -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -like "*\x64\*" } | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $makeappx) { throw "makeappx.exe not found under $sdkRoot" }
+          "makeappx=$($makeappx.FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Restore + publish the widget provider
+        shell: pwsh
+        run: |
+          msbuild windows\WidgetProvider\MyLinedChartWidgetProvider.csproj `
+            /restore /t:Publish /p:Configuration=Release `
+            /p:PublishDir=$PWD\windows\WidgetProvider\publish\ `
+            /nologo /v:minimal
+          if ($LASTEXITCODE -ne 0) { throw "msbuild failed with exit code $LASTEXITCODE" }
+          if (-not (Test-Path "windows\WidgetProvider\publish\MyLinedChartWidgetProvider.exe")) { throw "publish did not produce the provider exe" }
+
+      - name: Azure login (federated / OIDC)
+        if: ${{ env.AZURE_CLIENT_ID != '' }}
+        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign the widget provider exe (Azure Trusted Signing, same cert as the main app)
+        if: ${{ env.AZURE_CLIENT_ID != '' }}
+        uses: azure/trusted-signing-action@1d365fec12862c4aa68fcac418143d73f0cea293 # v0
+        with:
+          azure-tenant-id: ${{ env.AZURE_TENANT_ID }}
+          azure-client-id: ${{ env.AZURE_CLIENT_ID }}
+          endpoint: https://eus.codesigning.azure.net/
+          trusted-signing-account-name: mlcsigning
+          certificate-profile-name: mlc-public-trust
+          files: ${{ github.workspace }}\windows\WidgetProvider\publish\MyLinedChartWidgetProvider.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Stamp AppxManifest.xml (Version from the app, Publisher from the real cert)
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature windows\WidgetProvider\publish\MyLinedChartWidgetProvider.exe
+          if ($sig.Status -ne 'Valid') { throw "Provider exe is not validly signed ($($sig.Status))" }
+          node windows\Package\scripts\stamp-appx-identity.cjs --manifest windows\Package\AppxManifest.xml --publisher $sig.SignerCertificate.Subject
+          if ($LASTEXITCODE -ne 0) { throw "stamp-appx-identity.cjs failed with exit code $LASTEXITCODE" }
+
+      - name: Pack the sparse MSIX
+        shell: pwsh
+        env:
+          MAKEAPPX: ${{ steps.sdktools.outputs.makeappx }}
+        run: |
+          New-Item -ItemType Directory -Path windows\Package\dist -Force | Out-Null
+          & $env:MAKEAPPX pack /d windows\Package /p windows\Package\dist\MyLinedChartWidgets.msix /o
+          if ($LASTEXITCODE -ne 0) { throw "makeappx pack failed with exit code $LASTEXITCODE" }
+
+      - name: Sign the sparse MSIX (Azure Trusted Signing, same cert as the main app)
+        if: ${{ env.AZURE_CLIENT_ID != '' }}
+        uses: azure/trusted-signing-action@1d365fec12862c4aa68fcac418143d73f0cea293 # v0
+        with:
+          azure-tenant-id: ${{ env.AZURE_TENANT_ID }}
+          azure-client-id: ${{ env.AZURE_CLIENT_ID }}
+          endpoint: https://eus.codesigning.azure.net/
+          trusted-signing-account-name: mlcsigning
+          certificate-profile-name: mlc-public-trust
+          files: ${{ github.workspace }}\windows\Package\dist\MyLinedChartWidgets.msix
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Verify both signatures landed, then mark this job's output built
+        id: status
+        shell: pwsh
+        run: |
+          $exeSig = Get-AuthenticodeSignature windows\WidgetProvider\publish\MyLinedChartWidgetProvider.exe
+          $msixSig = Get-AuthenticodeSignature windows\Package\dist\MyLinedChartWidgets.msix
+          if ($exeSig.Status -ne 'Valid' -or $msixSig.Status -ne 'Valid') {
+            throw "Provider exe signature: $($exeSig.Status); sparse MSIX signature: $($msixSig.Status) -- refusing to ship an unsigned/invalid widget provider."
+          }
+          "built=true" >> $env:GITHUB_OUTPUT
+          Write-Host "Widget provider built and signed."
+
+      - name: Upload the signed widget provider bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: widget-provider-bundle
+          path: |
+            windows/WidgetProvider/publish/**
+            windows/Package/dist/MyLinedChartWidgets.msix
+          if-no-files-found: error
+          retention-days: 1
+
   build:
+    needs: build-widget-provider
+    # ★ TWO conditions, both load-bearing:
+    #   !cancelled() -- must run even if build-widget-provider failed outright
+    #     (its own continue-on-error: true keeps the WORKFLOW from failing over
+    #     it, but a job's default `if` still gates on its needs succeeding, and
+    #     belt-and-suspenders costs nothing here) -- a widget-provider
+    #     regression must never block shipping the main desktop app.
+    #   github.event_name == 'workflow_dispatch' -- this workflow's own test-only
+    #     pull_request trigger (see the `on:` block's comment) exists ONLY to
+    #     give build-widget-provider a real pre-merge run; build/sign/publish
+    #     must never run, build a real installer, or touch the public Release
+    #     from a pull_request event.
+    if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' }}
     runs-on: windows-latest
     permissions:
       contents: read
@@ -40,6 +216,21 @@ jobs:
           repository: none298-dotcom/MyLinedChart
           ref: ${{ inputs.ref }}
           token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+
+      # ★ Best-effort per build-widget-provider's own header: only fetched
+      # when that job actually succeeded (continue-on-error there means its
+      # own conclusion never blocks this `needs:`, so `outputs.built` is what
+      # tells this job which case it's in). windows-app/scripts/
+      # stage-widget-provider.js (run by predist:win, below) looks for these
+      # exact paths and quietly ships without a widget provider if either is
+      # missing -- see that script's own comment for why that is a working
+      # build, not a failed one.
+      - name: Fetch the signed widget provider (best-effort)
+        if: ${{ needs.build-widget-provider.outputs.built == 'true' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: widget-provider-bundle
+          path: windows
 
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4

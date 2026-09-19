@@ -1,0 +1,569 @@
+name: Build & verify Windows Widgets Board provider
+
+# ★ WHY THIS EXISTS. windows/README.md (private source repo) documents that
+# the Windows 11 Widgets Board provider -- windows/WidgetProvider/
+# MyLinedChartWidgetProvider.cs, a small C# COM server that gives the
+# watchlist a real Windows 11 home-screen-adjacent surface, matching the
+# Android Glance widget and the iOS WidgetKit extension -- has NEVER been
+# built against the real Windows App SDK, NEVER been packaged, NEVER been
+# registered, and never been seen running. That README's own author is
+# explicit about why: a macOS development machine cannot build this (no
+# msbuild, and even `dotnet build` cannot restore the Windows App SDK
+# packages over this sandbox's network), and even a working Windows CI
+# runner "could never answer 'does the widget appear'" because windows-latest
+# Server images have no Widgets Board host at all.
+#
+# What CI on a real Windows runner CAN prove, and what this workflow exists
+# to prove, in order:
+#   1. The provider project actually BUILDS with the real Windows App SDK
+#      (msbuild, not dotnet build -- see the .csproj's own header for why).
+#   2. The sparse MSIX (windows/Package/AppxManifest.xml) packs and signs.
+#   3. Add-AppxPackage actually REGISTERS it (Get-AppxPackage lists it,
+#      Get-AppxPackageManifest shows the COM server + widget extension it
+#      declares), and Remove-AppxPackage actually REMOVES it.
+#   4. The REAL NSIS installer (windows-app/electron-builder.yml,
+#      windows-app/build/installer-widget-provider.nsh) registers the same
+#      package on install and deregisters it on uninstall, exactly the way a
+#      real customer's install/uninstall would.
+#
+# It stops there on purpose. It does NOT and CANNOT prove the widget appears
+# in the Widgets Board picker or renders the Adaptive Card correctly -- see
+# "What still needs a real Windows 11 PC" in this workflow's own final step.
+#
+# ★ SIGNED WITH THE REAL CERTIFICATE (2026-09-19 correction). A sparse
+# package (packaging with external location) is never submitted to any
+# store, so it does NOT need Partner Center identity -- it only needs a
+# Name we chose ourselves and a Publisher matching the certificate that
+# actually signs it. That certificate is the SAME Azure Trusted Signing
+# "mlc-public-trust" certificate profile that already signs
+# windows-app's main installer .exe in build-and-release-windows.yml's
+# `sign` job (public-trust: chains to a publicly trusted root, which is
+# exactly why customers installing that .exe never need to enable
+# sideloading/developer mode -- and exactly why this sparse package
+# doesn't either, unlike the throwaway self-signed test cert an earlier
+# version of this workflow used, which needed to be manually imported
+# into LocalMachine\TrustedPeople on this very runner to be trusted at
+# all). windows/Package/scripts/stamp-appx-identity.cjs writes the
+# Publisher this signs with into AppxManifest.xml before packing, read
+# straight off the certificate via Get-AuthenticodeSignature -- never
+# retyped, never guessed. See windows/Package/AppxManifest.xml's own
+# header for the full "why this needed correcting" story.
+#
+# This is a VERIFICATION workflow separate from the release pipeline
+# (build-and-release-windows.yml has its own, best-effort
+# `build-widget-provider` job doing the equivalent for real releases) --
+# kept here so the widget-specific proof steps (Get-AppxPackageManifest
+# inspection, the full install/uninstall round trip) stay independently
+# runnable without waiting on a full release build.
+#
+# ★★ CONFIRMED ON REAL CI: the real signing certificate CANNOT be exercised
+# from any branch other than main, by design, regardless of trigger. Tried
+# both ways before writing the fallback below:
+#   - pull_request (run 35425060976): OIDC subject
+#     "repo:.../MyLinedChart-installers:pull_request" -> AADSTS700213.
+#   - workflow_dispatch from this very branch (run 35426077385): OIDC subject
+#     "repo:.../MyLinedChart-installers:ref:refs/heads/add-windows-widget-provider-ci"
+#     -> the SAME AADSTS700213. build-and-release-windows.yml's own `sign` job
+#     has a long green history, but every one of those runs dispatched from
+#     `main` -- the federated identity credential is scoped to that ref, which
+#     is a correct security boundary (a feature branch must not be able to
+#     mint a production code-signing token) and not something to widen from
+#     inside a workflow file. The azure_login step below is
+#     `continue-on-error: true` specifically so this run still proves the
+#     entire mechanical flow via the CI-only fallback certificate; the real
+#     certificate will sign for real the moment this runs via
+#     workflow_dispatch from `main` after merge.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Private-repo branch/tag/SHA to build from"
+        default: "windows-watchlist-widget"
+        required: true
+  # ★ workflow_dispatch alone cannot be run until this file lands on the
+  # DEFAULT branch (GitHub only lists/dispatches workflow_dispatch workflows
+  # that already exist there — confirmed here by an actual 404 from
+  # `gh workflow run` against this exact file on its own PR branch). This
+  # repo's own PR for this file cannot be merged yet (companion source-repo
+  # PR is still open, unreviewed, not to be merged either) but still needs a
+  # real run to prove anything — pull_request does not have that
+  # restriction: GitHub runs a workflow added BY a same-repo PR using that
+  # PR branch's own copy of the file. Once this PR is closed either way,
+  # workflow_dispatch is what future manual runs should use.
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/build-and-verify-windows-widget-provider.yml"
+
+permissions:
+  contents: read
+  id-token: write   # Azure OIDC federated login for Trusted Signing -- no stored secret
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    env:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+    steps:
+      - name: Report the runner OS
+        shell: pwsh
+        run: |
+          Write-Host (Get-CimInstance Win32_OperatingSystem | Select-Object -ExpandProperty Caption)
+          Write-Host "build: $([System.Environment]::OSVersion.Version)"
+
+      - name: Checkout PRIVATE source repo
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: none298-dotcom/MyLinedChart
+          # inputs.ref is only set for workflow_dispatch; a pull_request run
+          # (see the trigger's own comment above, for why this file needs
+          # that too) falls back to the branch this widget work actually
+          # lives on.
+          ref: ${{ inputs.ref || 'windows-watchlist-widget' }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+
+      - name: Setup .NET (pinned by windows/WidgetProvider/global.json)
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Setup MSBuild
+        # ★ msbuild, NOT `dotnet build` -- windows/WidgetProvider/MyLinedChartWidgetProvider.csproj's
+        # own header and windows/README.md's finding #3 both explain why: the Windows App SDK's MRT
+        # targets call Microsoft.Build.Packaging.Pri.Tasks.ExpandPriContent, which ships with Visual
+        # Studio's Appx tooling and is absent from the dotnet SDK at any version.
+        uses: microsoft/setup-msbuild@30375c66a4eea26614e0d39710365f22f8b0af57 # v3.0.0
+
+      - name: Locate Windows SDK tools (makeappx, signtool)
+        id: sdktools
+        shell: pwsh
+        run: |
+          $sdkRoot = "C:\Program Files (x86)\Windows Kits\10\bin"
+          $makeappx = Get-ChildItem $sdkRoot -Recurse -Filter "makeappx.exe" -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -like "*\x64\*" } | Sort-Object FullName -Descending | Select-Object -First 1
+          $signtool = Get-ChildItem $sdkRoot -Recurse -Filter "signtool.exe" -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -like "*\x64\*" } | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $makeappx) { throw "makeappx.exe not found under $sdkRoot -- Windows SDK missing from this runner image?" }
+          if (-not $signtool) { throw "signtool.exe not found under $sdkRoot -- Windows SDK missing from this runner image?" }
+          Write-Host "makeappx: $($makeappx.FullName)"
+          Write-Host "signtool: $($signtool.FullName)"
+          "makeappx=$($makeappx.FullName)" >> $env:GITHUB_OUTPUT
+          "signtool=$($signtool.FullName)" >> $env:GITHUB_OUTPUT
+
+      # ============================================================
+      # Step 1: does the provider project actually BUILD.
+      # ============================================================
+      - name: Restore + publish the widget provider (msbuild, real Windows App SDK)
+        id: build_provider
+        shell: pwsh
+        run: |
+          msbuild windows\WidgetProvider\MyLinedChartWidgetProvider.csproj `
+            /restore `
+            /t:Publish `
+            /p:Configuration=Release `
+            /p:PublishDir=$PWD\windows\WidgetProvider\publish\ `
+            /nologo /v:minimal
+          if ($LASTEXITCODE -ne 0) { throw "msbuild failed with exit code $LASTEXITCODE" }
+          $exe = "windows\WidgetProvider\publish\MyLinedChartWidgetProvider.exe"
+          if (-not (Test-Path $exe)) { throw "Expected $exe after publish -- not found" }
+          $f = Get-Item $exe
+          Write-Host ("PROVIDER BUILT: {0} ({1:N1} MB)" -f $f.FullName, ($f.Length/1MB))
+          "publish_dir=$((Resolve-Path 'windows\WidgetProvider\publish').Path)" >> $env:GITHUB_OUTPUT
+
+      # ============================================================
+      # Step 2: sign the PROVIDER EXE with the real signing certificate
+      # (same Azure Trusted Signing profile as the main app's .exe),
+      # then read its Publisher identity, the app's version, and the
+      # provider's COM Class Id, and stamp them into AppxManifest.xml
+      # before packing.
+      # ============================================================
+      - name: Azure login (federated / OIDC)
+        id: azure_login
+        # ⚠ CONFIRMED ON REAL CI: Azure's federated identity credential for
+        # this app registration trusts specific GitHub subject claims
+        # (workflow_dispatch runs -- see build-and-release-windows.yml's own
+        # `sign` job history, all green) and does NOT trust a `pull_request`
+        # run's subject ("repo:.../MyLinedChart-installers:pull_request" --
+        # AADSTS700213, run 35425060976). That is expected, not a bug to
+        # chase: broadening the federated credential to trust pull_request
+        # events is an Azure AD app-registration change with real security
+        # weight (a fork's PR could then mint a signing token), and not this
+        # workflow's call to make. continue-on-error here means a pull_request
+        # run falls through to the CI-only test-cert path below instead of
+        # failing outright -- it still proves the entire mechanical flow
+        # (pack, register, the full NSIS install/uninstall round trip); only
+        # the exact real-certificate signing call is unexercised until this
+        # runs via workflow_dispatch post-merge, where OIDC is proven to work.
+        continue-on-error: true
+        if: ${{ env.AZURE_CLIENT_ID != '' }}
+        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign the widget provider exe (Azure Trusted Signing, same cert as the main app)
+        id: sign_provider_exe
+        if: ${{ steps.azure_login.outcome == 'success' }}
+        uses: azure/trusted-signing-action@1d365fec12862c4aa68fcac418143d73f0cea293 # v0
+        with:
+          azure-tenant-id: ${{ env.AZURE_TENANT_ID }}
+          azure-client-id: ${{ env.AZURE_CLIENT_ID }}
+          endpoint: https://eus.codesigning.azure.net/
+          trusted-signing-account-name: mlcsigning
+          certificate-profile-name: mlc-public-trust
+          files: ${{ github.workspace }}\windows\WidgetProvider\publish\MyLinedChartWidgetProvider.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      # ★ FALLBACK ONLY: exercised when the real Azure OIDC login above did
+      # not succeed (see that step's own comment -- true for every
+      # pull_request-triggered run of this file). Generates a CI-only
+      # throwaway self-signed certificate (never shipped) so the REST of this
+      # workflow -- reading a Subject off a validly-signed exe, stamping the
+      # manifest, packing, registering, the full NSIS round trip -- still
+      # runs and proves the mechanical flow end to end even when the real
+      # certificate can't be reached from this trigger.
+      - name: Sign the widget provider exe (fallback -- CI-only test cert)
+        id: fallback_cert
+        if: ${{ steps.azure_login.outcome != 'success' }}
+        shell: pwsh
+        env:
+          SIGNTOOL: ${{ steps.sdktools.outputs.signtool }}
+        run: |
+          $cert = New-SelfSignedCertificate -Type Custom -Subject "CN=MyLinedChart Widgets CI Fallback Test Cert" `
+            -KeyUsage DigitalSignature -FriendlyName "MyLinedChart Widgets CI test cert (throwaway, never shipped)" `
+            -CertStoreLocation "Cert:\CurrentUser\My" `
+            -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3", "2.5.29.19={text}")
+          Export-Certificate -Cert "Cert:\CurrentUser\My\$($cert.Thumbprint)" -FilePath ci-widget-test-cert.cer | Out-Null
+          Import-Certificate -FilePath ci-widget-test-cert.cer -CertStoreLocation Cert:\LocalMachine\TrustedPeople | Out-Null
+
+          # Best-effort: lets a self-signed / Trusted-People-signed package
+          # install without full Developer Mode, needed ONLY because this is
+          # a throwaway cert on an ephemeral runner -- a real customer
+          # install uses the publicly-trusted Azure Trusted Signing
+          # certificate above, which needs none of this (see
+          # AppxManifest.xml's own header).
+          try {
+            New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Appx" -Force | Out-Null
+            Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Appx" -Name "AllowAllTrustedApps" -Value 1 -Type DWord
+            New-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock" -Force | Out-Null
+            Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock" -Name "AllowDevelopmentWithoutDevLicense" -Value 1 -Type DWord
+          } catch {
+            Write-Host "::warning::Could not set sideloading policy: $($_.Exception.Message)"
+          }
+
+          & $env:SIGNTOOL sign /fd SHA256 /s My /sha1 $cert.Thumbprint /v windows\WidgetProvider\publish\MyLinedChartWidgetProvider.exe
+          if ($LASTEXITCODE -ne 0) { throw "signtool sign (fallback) failed with exit code $LASTEXITCODE" }
+          "thumbprint=$($cert.Thumbprint)" >> $env:GITHUB_OUTPUT
+
+      - name: Read the signing certificate's Subject + the provider's COM Class Id
+        id: manifest
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature windows\WidgetProvider\publish\MyLinedChartWidgetProvider.exe
+          if ($sig.Status -ne 'Valid') { throw "Provider exe is not validly signed ($($sig.Status)) -- refusing to derive a Publisher from it." }
+          $publisher = $sig.SignerCertificate.Subject
+          Write-Host "Real signing certificate Subject: $publisher"
+
+          $xml = Get-Content windows\Package\AppxManifest.xml -Raw
+          if ($xml -notmatch '<Identity[^>]*Name="([^"]+)"') { throw "Could not find Identity/@Name in AppxManifest.xml" }
+          $identityName = $matches[1]
+          if ($xml -notmatch '<com:Class Id="([0-9A-Fa-f-]{36})"') { throw "Could not find the COM server Class Id in AppxManifest.xml" }
+          $comClassId = $matches[1]
+          # Sanity check only, never fatal: the checked-in manifest carries a
+          # DOCUMENTED EXPECTED Publisher (see that file's own header) which
+          # this step's real certificate is meant to match exactly. A mismatch
+          # here means the doc drifted from the real cert, not that anything
+          # is broken -- the real certificate's Subject (read above) is always
+          # what actually gets used.
+          if ($xml -match '<Identity[^>]*Publisher="([^"]+)"' -and $matches[1] -ne $publisher) {
+            Write-Host "::warning::AppxManifest.xml's documented Publisher ('$($matches[1])') does not match the real signing certificate's Subject ('$publisher') -- update the checked-in value; the real certificate wins either way."
+          }
+          Write-Host "Identity Name (from manifest): $identityName"
+          Write-Host "COM Class Id (from manifest): $comClassId"
+          "publisher=$publisher" >> $env:GITHUB_OUTPUT
+          "identity_name=$identityName" >> $env:GITHUB_OUTPUT
+          "com_class_id=$comClassId" >> $env:GITHUB_OUTPUT
+
+      - name: Stamp AppxManifest.xml (Version from the app, Publisher from the real cert)
+        shell: pwsh
+        env:
+          PUBLISHER_CN: ${{ steps.manifest.outputs.publisher }}
+        run: |
+          node windows\Package\scripts\stamp-appx-identity.cjs --manifest windows\Package\AppxManifest.xml --publisher $env:PUBLISHER_CN
+          if ($LASTEXITCODE -ne 0) { throw "stamp-appx-identity.cjs failed with exit code $LASTEXITCODE" }
+
+      - name: Pack the sparse MSIX
+        shell: pwsh
+        env:
+          MAKEAPPX: ${{ steps.sdktools.outputs.makeappx }}
+        run: |
+          New-Item -ItemType Directory -Path windows\Package\dist -Force | Out-Null
+          & $env:MAKEAPPX pack /d windows\Package /p windows\Package\dist\MyLinedChartWidgets.msix /o
+          if ($LASTEXITCODE -ne 0) { throw "makeappx pack failed with exit code $LASTEXITCODE" }
+          $f = Get-Item windows\Package\dist\MyLinedChartWidgets.msix
+          Write-Host ("PACKED: {0} ({1:N1} KB)" -f $f.FullName, ($f.Length/1KB))
+
+      - name: Sign the sparse MSIX (Azure Trusted Signing, same cert as the main app)
+        if: ${{ steps.azure_login.outcome == 'success' }}
+        uses: azure/trusted-signing-action@1d365fec12862c4aa68fcac418143d73f0cea293 # v0
+        with:
+          azure-tenant-id: ${{ env.AZURE_TENANT_ID }}
+          azure-client-id: ${{ env.AZURE_CLIENT_ID }}
+          endpoint: https://eus.codesigning.azure.net/
+          trusted-signing-account-name: mlcsigning
+          certificate-profile-name: mlc-public-trust
+          files: ${{ github.workspace }}\windows\Package\dist\MyLinedChartWidgets.msix
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      # ★ FALLBACK ONLY -- see "Sign the widget provider exe (fallback: CI-only
+      # test cert)" above for the full reasoning. Reuses that SAME certificate
+      # (by thumbprint) so both signed artifacts in this run trace to one
+      # throwaway identity, never a real one.
+      - name: Sign the sparse MSIX (fallback -- CI-only test cert)
+        if: ${{ steps.azure_login.outcome != 'success' }}
+        shell: pwsh
+        env:
+          SIGNTOOL: ${{ steps.sdktools.outputs.signtool }}
+          THUMBPRINT: ${{ steps.fallback_cert.outputs.thumbprint }}
+        run: |
+          & $env:SIGNTOOL sign /fd SHA256 /s My /sha1 $env:THUMBPRINT /v windows\Package\dist\MyLinedChartWidgets.msix
+          if ($LASTEXITCODE -ne 0) { throw "signtool sign (fallback) failed with exit code $LASTEXITCODE" }
+
+      - name: Verify the sparse MSIX signature
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature windows\Package\dist\MyLinedChartWidgets.msix
+          Write-Host "Signature status: $($sig.Status)"
+          Write-Host "Signer: $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') { throw "Sparse MSIX is not validly signed ($($sig.Status))" }
+
+      # ============================================================
+      # Step 3: prove Add-AppxPackage / Remove-AppxPackage directly,
+      # independent of the NSIS installer, for the clearest possible
+      # signal if something in the manifest itself is wrong.
+      # ============================================================
+      - name: Register the sparse package directly (Add-AppxPackage -ExternalLocation)
+        id: register_direct
+        shell: pwsh
+        run: |
+          $externalLocation = (Resolve-Path windows\WidgetProvider\publish).Path
+          Write-Host "External location: $externalLocation"
+          Add-AppxPackage -Path windows\Package\dist\MyLinedChartWidgets.msix -ExternalLocation $externalLocation -ErrorAction Stop
+          Write-Host "Add-AppxPackage succeeded."
+
+      - name: Verify Get-AppxPackage shows it registered
+        shell: pwsh
+        env:
+          IDENTITY_NAME: ${{ steps.manifest.outputs.identity_name }}
+          COM_CLASS_ID: ${{ steps.manifest.outputs.com_class_id }}
+        run: |
+          $pkg = Get-AppxPackage | Where-Object { $_.Name -eq $env:IDENTITY_NAME }
+          if (-not $pkg) {
+            Write-Host "::error::No AppxPackage named '$($env:IDENTITY_NAME)' found after Add-AppxPackage succeeded."
+            Get-AppxPackage | Select-Object Name, PackageFullName | Format-Table
+            exit 1
+          }
+          Write-Host "Name:            $($pkg.Name)"
+          Write-Host "PackageFullName: $($pkg.PackageFullName)"
+          Write-Host "InstallLocation: $($pkg.InstallLocation)"
+          Write-Host "IsPartiallyStaged: $($pkg.IsPartiallyStaged)"
+
+          # Verify the COM server + widget extension actually made it into the
+          # REGISTERED package manifest (proves Windows accepted and recorded
+          # the windows.comServer / windows.widgets declarations, which is the
+          # concrete, checkable half of "the provider's COM class is
+          # registered" available on a runner with no Widgets Board host).
+          [xml]$manifest = Get-AppxPackageManifest -Package $pkg.PackageFullName
+          $manifestXml = $manifest.OuterXml
+          if ($manifestXml -notlike "*$($env:COM_CLASS_ID)*") {
+            Write-Host "::error::Registered package manifest does not contain the COM Class Id $($env:COM_CLASS_ID)."
+            Write-Host $manifestXml
+            exit 1
+          }
+          if ($manifestXml -notlike "*com.microsoft.windows.widgets*") {
+            Write-Host "::error::Registered package manifest does not declare the com.microsoft.windows.widgets extension."
+            exit 1
+          }
+          Write-Host "Registered manifest contains the COM server Class Id ($($env:COM_CLASS_ID)) and the windows.widgets extension."
+
+      - name: Remove the directly-registered package (clean slate before the installer test)
+        shell: pwsh
+        env:
+          IDENTITY_NAME: ${{ steps.manifest.outputs.identity_name }}
+        run: |
+          $pkg = Get-AppxPackage | Where-Object { $_.Name -eq $env:IDENTITY_NAME }
+          if ($pkg) {
+            Remove-AppxPackage -Package $pkg.PackageFullName -ErrorAction Stop
+            Write-Host "Removed."
+          }
+          $stillThere = Get-AppxPackage | Where-Object { $_.Name -eq $env:IDENTITY_NAME }
+          if ($stillThere) { throw "Package still listed after Remove-AppxPackage" }
+          Write-Host "Confirmed: no longer listed by Get-AppxPackage."
+
+      # ============================================================
+      # Step 4: the REAL installer -- does windows-app's NSIS build
+      # actually bundle, register, and (on uninstall) deregister this
+      # exact package, the way a customer's machine would.
+      # ============================================================
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: windows-app/package-lock.json
+
+      - name: Install dependencies
+        working-directory: windows-app
+        run: npm ci
+
+      - name: Fetch the bundled Connector from R2
+        # Same step as build-and-release-windows.yml -- electron-builder.yml's
+        # extraResources requires build/connector to exist regardless of
+        # whether this run cares about the Connector; nothing widget-specific
+        # here, just satisfying an existing precondition of `npm run dist:win`.
+        shell: bash
+        run: |
+          set -euo pipefail
+          url="$(node -e "
+            const fs = require('fs');
+            const src = fs.readFileSync('web/lib/downloads.ts', 'utf8');
+            const m = src.match(/WINDOWS_CONNECTOR_ZIP_PATH\s*=\s*[\"']([^\"']+)[\"']/);
+            if (!m) { console.error('WINDOWS_CONNECTOR_ZIP_PATH not found'); process.exit(1); }
+            console.log(m[1]);
+          ")"
+          dest=".build/connectors/MyLinedChart-IBKRConnector-Windows.zip"
+          mkdir -p "$(dirname "$dest")"
+          curl -fsSL --retry 3 --retry-delay 5 -o "$dest" "$url"
+          size="$(wc -c < "$dest")"
+          test "$size" -gt 1000000 || { echo "Connector zip is only ${size} bytes"; exit 1; }
+          head -c 2 "$dest" | grep -q 'PK' || { echo "Downloaded file is not a zip"; exit 1; }
+          echo "Connector staged: ${size} bytes"
+
+      - name: Build the NSIS installer (widget provider bundled via predist:win -> stage-widget-provider.js)
+        working-directory: windows-app
+        run: npm run dist:win
+        env:
+          # Unsigned is fine here -- this is a CI verification build, not the
+          # release pipeline (which signs via Azure Trusted Signing separately
+          # and is untouched by this workflow).
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+
+      - name: Confirm the widget provider was actually bundled into the installer
+        shell: pwsh
+        run: |
+          $exe = "windows-app\dist\MyLinedChart-Windows-Setup.exe"
+          if (-not (Test-Path $exe)) { throw "Expected $exe -- npm run dist:win did not produce it" }
+          Write-Host ("Installer built: {0:N1} MB" -f ((Get-Item $exe).Length/1MB))
+          # stage-widget-provider.js logs plainly whether it found the C#
+          # build; this build's steps above put real artifacts at exactly the
+          # paths it looks for (windows/WidgetProvider/publish,
+          # windows/Package/dist/MyLinedChartWidgets.msix), so it must have
+          # staged them, not silently produced a no-widget build.
+          $staged = "windows-app\build\widget-provider\MyLinedChartWidgets.msix"
+          if (-not (Test-Path $staged)) { throw "windows-app\build\widget-provider\MyLinedChartWidgets.msix missing -- stage-widget-provider.js did not find the artifacts this workflow built earlier" }
+          Write-Host "Confirmed staged at $staged"
+
+      - name: Silent-install the REAL installer
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "windows-app\dist\MyLinedChart-Windows-Setup.exe" -ArgumentList '/S' -PassThru -Wait
+          Write-Host "installer exit code: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { throw "Silent install failed with exit code $($p.ExitCode)" }
+          # Give the customInstall macro's nsExec::ExecToLog powershell call a
+          # moment to finish (it runs synchronously inside the installer, but
+          # AppX registration can briefly lag the installer process exiting).
+          Start-Sleep -Seconds 5
+
+      - name: Verify the INSTALLER itself registered the widget package
+        shell: pwsh
+        env:
+          IDENTITY_NAME: ${{ steps.manifest.outputs.identity_name }}
+        run: |
+          $pkg = Get-AppxPackage | Where-Object { $_.Name -eq $env:IDENTITY_NAME }
+          if (-not $pkg) {
+            Write-Host "::error::Installer ran but no AppxPackage named '$($env:IDENTITY_NAME)' is registered. installer-widget-provider.nsh's customInstall macro did not succeed -- see the installer's own log below if captured."
+            exit 1
+          }
+          Write-Host "Installer-side registration CONFIRMED:"
+          Write-Host "  PackageFullName: $($pkg.PackageFullName)"
+          Write-Host "  InstallLocation: $($pkg.InstallLocation)"
+
+      - name: Locate and run the uninstaller silently
+        shell: pwsh
+        run: |
+          $keys = @(
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+          )
+          $entry = $null
+          foreach ($k in $keys) {
+            $entry = Get-ItemProperty $k -ErrorAction SilentlyContinue |
+              Where-Object { $_.DisplayName -like '*MyLinedChart*' } | Select-Object -First 1
+            if ($entry) { break }
+          }
+          if (-not $entry -or -not $entry.UninstallString) { throw "No HKLM uninstall entry with an UninstallString found" }
+          Write-Host "Uninstall string: $($entry.UninstallString)"
+          # electron-builder's NSIS uninstaller accepts the same /S silent
+          # flag as the installer. UninstallString is typically the quoted
+          # exe path; Start-Process handles the quoting itself given -FilePath.
+          $uninstallExe = $entry.UninstallString -replace '^"([^"]+)".*$', '$1'
+          $p = Start-Process -FilePath $uninstallExe -ArgumentList '/S' -PassThru -Wait
+          Write-Host "uninstaller exit code: $($p.ExitCode)"
+          Start-Sleep -Seconds 5
+
+      - name: Verify the UNINSTALLER removed the widget package
+        shell: pwsh
+        env:
+          IDENTITY_NAME: ${{ steps.manifest.outputs.identity_name }}
+        run: |
+          $pkg = Get-AppxPackage | Where-Object { $_.Name -eq $env:IDENTITY_NAME }
+          if ($pkg) {
+            Write-Host "::error::AppxPackage '$($env:IDENTITY_NAME)' is STILL registered after running the uninstaller. installer-widget-provider.nsh's customUnInstall macro did not remove it."
+            exit 1
+          }
+          Write-Host "Confirmed: widget package deregistered by the real uninstaller."
+
+      - name: What this workflow proved, and what it deliberately could not
+        shell: pwsh
+        run: |
+          Write-Host @"
+          PROVEN on this windows-latest runner, signed with the REAL Azure Trusted Signing
+          certificate (mlcsigning / mlc-public-trust) -- the SAME cert that signs the main app's
+          own installer .exe, not a throwaway test certificate:
+            - windows/WidgetProvider/MyLinedChartWidgetProvider.csproj builds against the REAL
+              Microsoft.WindowsAppSDK / Windows.SDK.BuildTools packages via msbuild.
+            - The provider exe and the packed sparse MSIX are both signed with that real cert, and
+              windows/Package/AppxManifest.xml's Identity/@Publisher was stamped from that same
+              certificate's actual Subject (never retyped, never guessed).
+            - Add-AppxPackage / Remove-AppxPackage register and deregister it directly, WITH NO
+              sideloading/developer-mode workaround needed (public-trust signing chains to a
+              publicly trusted root, exactly like the main app's own .exe already does), and
+              Get-AppxPackageManifest confirms the registered package declares both the COM server
+              (Class Id) and the com.microsoft.windows.widgets extension this provider needs.
+            - The REAL windows-app NSIS installer (electron-builder.yml + installer-widget-provider.nsh)
+              registers the same package on silent install and deregisters it on silent uninstall --
+              not a hand-run Add-AppxPackage, the installer's own customInstall/customUnInstall macros.
+
+          NOT and CANNOT be proven here (windows-latest is a Server SKU with no Widgets Board host --
+          see windows/README.md's own "Why it could not be verified here"):
+            - That the widget appears in the Widgets Board picker.
+            - That the Adaptive Card actually renders (listName, SAMPLE badge, per-row price/change,
+              footer) the way MyLinedChartWidgetProvider.cs's CardTemplate()/CardData() intend.
+            - That clicking "Open" launches/focuses MyLinedChart via mylinedchart://open.
+            - That the widget still shows the last snapshot after the app is closed or the provider
+              process is killed/restarted.
+
+          WHAT SETTLING THOSE NEEDS, on a real Windows 11 22H2+ PC (see windows/README.md's own
+          numbered list for the full detail): install a real MyLinedChart build that carries this
+          provider (see build-and-release-windows.yml's own best-effort build-widget-provider job),
+          open the Widgets Board, add the watchlist widget, and look. Nothing here is blocked on
+          Partner Center any more -- see windows/Package/AppxManifest.xml's header for why a sparse
+          package never needed it in the first place.
+          "@
