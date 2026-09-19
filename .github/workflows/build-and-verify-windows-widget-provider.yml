@@ -438,3 +438,4 @@ jobs:
           widget, and look.
           "@
 # re-run: source repo pushed the makeappx placeholder fix (1f34db10)
+# re-run: fixed invalid XML comment (8e22e165)
