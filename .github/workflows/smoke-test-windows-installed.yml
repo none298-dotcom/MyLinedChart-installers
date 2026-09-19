@@ -193,6 +193,37 @@ jobs:
           Write-Host "--- resources\ (what actually shipped) ---"
           Get-ChildItem (Join-Path $dir 'resources') -ErrorAction SilentlyContinue | Format-Table Name,Length
 
+      # ★ Windows 11 Widgets Board watchlist provider (windows/WidgetProvider/,
+      # windows-app/build/installer-widget-provider.nsh's customInstall macro).
+      # BEST-EFFORT BY DESIGN (build-and-release-windows.yml's own
+      # `build-widget-provider` job can legitimately fail without blocking a
+      # release — see that job's header), so this step only HARD-FAILS when the
+      # installer actually bundled the sparse package and registration still
+      # didn't happen; an installer built without one (no widget-provider
+      # resources at all) is a known, acceptable shape and only warns. Proven
+      # end to end (build, sign, pack, install, uninstall) in
+      # build-and-verify-windows-widget-provider.yml; this is the one check
+      # that watches it stay true on the artifact this workflow actually ships.
+      - name: Assert the Widgets Board provider registered, if this build bundled one
+        shell: pwsh
+        env:
+          INSTALLED_EXE: ${{ steps.locate.outputs.exe }}
+        run: |
+          $installedRoot = Split-Path $env:INSTALLED_EXE -Parent
+          $bundledMsix = Join-Path $installedRoot 'resources\widget-provider\MyLinedChartWidgets.msix'
+          if (-not (Test-Path $bundledMsix)) {
+            Write-Host "::warning::This build did not bundle a Widgets Board provider (no $bundledMsix) — best-effort, see build-and-release-windows.yml's build-widget-provider job. Skipping the registration check."
+            exit 0
+          }
+          Write-Host "Bundled sparse package found at $bundledMsix — expecting it to be registered."
+          $pkg = Get-AppxPackage -Name 'LittleBirdTrading.MyLinedChart.WidgetProvider' -ErrorAction SilentlyContinue
+          if (-not $pkg) {
+            Write-Host "::error::The installer bundled a Widgets Board provider but Get-AppxPackage does not show it registered. installer-widget-provider.nsh's customInstall macro did not succeed on this install."
+            exit 1
+          }
+          Write-Host "PackageFullName: $($pkg.PackageFullName)"
+          Write-Host "InstallLocation: $($pkg.InstallLocation)"
+
       - name: Launch the INSTALLED app and prove it stays alive
         shell: pwsh
         env:

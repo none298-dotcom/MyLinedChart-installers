@@ -30,24 +30,31 @@ name: Build & verify Windows Widgets Board provider
 # in the Widgets Board picker or renders the Adaptive Card correctly -- see
 # "What still needs a real Windows 11 PC" in this workflow's own final step.
 #
-# ★ CI-ONLY TEST CERTIFICATE, NEVER SHIPPED. windows/Package/AppxManifest.xml's
-# Identity/@Publisher is a documented placeholder ("TODO-from-partner-center")
-# because the real value can only come from Partner Center once the product
-# exists there, matching windows-app/electron-builder.yml's own appx: block
-# for the main app's Store MSIX. This workflow generates a throwaway
-# self-signed certificate whose Subject matches that exact placeholder string
-# (read out of the manifest, not hand-copied, so the two can never drift) and
-# trusts it ONLY on this ephemeral runner (LocalMachine\TrustedPeople +
-# sideloading policy), purely so Add-AppxPackage has something to validate
-# against. Nothing here is signed with, or ships with, any real certificate --
-# production packaging still needs Partner Center's real identity and the
-# same signing identity windows-app/electron-builder.yml's `win.sign` note
-# already documents for the main app.
+# ★ SIGNED WITH THE REAL CERTIFICATE (2026-09-19 correction). A sparse
+# package (packaging with external location) is never submitted to any
+# store, so it does NOT need Partner Center identity -- it only needs a
+# Name we chose ourselves and a Publisher matching the certificate that
+# actually signs it. That certificate is the SAME Azure Trusted Signing
+# "mlc-public-trust" certificate profile that already signs
+# windows-app's main installer .exe in build-and-release-windows.yml's
+# `sign` job (public-trust: chains to a publicly trusted root, which is
+# exactly why customers installing that .exe never need to enable
+# sideloading/developer mode -- and exactly why this sparse package
+# doesn't either, unlike the throwaway self-signed test cert an earlier
+# version of this workflow used, which needed to be manually imported
+# into LocalMachine\TrustedPeople on this very runner to be trusted at
+# all). windows/Package/scripts/stamp-appx-identity.cjs writes the
+# Publisher this signs with into AppxManifest.xml before packing, read
+# straight off the certificate via Get-AuthenticodeSignature -- never
+# retyped, never guessed. See windows/Package/AppxManifest.xml's own
+# header for the full "why this needed correcting" story.
 #
-# This is a VERIFICATION workflow, not part of the release pipeline
-# (build-and-release-windows.yml is untouched) -- production shipping of the
-# widget provider is still blocked on real Partner Center identity, exactly
-# as windows/Package/AppxManifest.xml's own header states.
+# This is a VERIFICATION workflow separate from the release pipeline
+# (build-and-release-windows.yml has its own, best-effort
+# `build-widget-provider` job doing the equivalent for real releases) --
+# kept here so the widget-specific proof steps (Get-AppxPackageManifest
+# inspection, the full install/uninstall round trip) stay independently
+# runnable without waiting on a full release build.
 
 on:
   workflow_dispatch:
@@ -73,10 +80,14 @@ on:
 
 permissions:
   contents: read
+  id-token: write   # Azure OIDC federated login for Trusted Signing -- no stored secret
 
 jobs:
   verify:
     runs-on: windows-latest
+    env:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
     steps:
       - name: Report the runner OS
         shell: pwsh
@@ -144,60 +155,74 @@ jobs:
           "publish_dir=$((Resolve-Path 'windows\WidgetProvider\publish').Path)" >> $env:GITHUB_OUTPUT
 
       # ============================================================
-      # Step 2: pack + sign the sparse MSIX with a CI-only test cert
-      # whose Subject matches AppxManifest.xml's placeholder exactly.
+      # Step 2: sign the PROVIDER EXE with the real signing certificate
+      # (same Azure Trusted Signing profile as the main app's .exe),
+      # then read its Publisher identity, the app's version, and the
+      # provider's COM Class Id, and stamp them into AppxManifest.xml
+      # before packing.
       # ============================================================
-      - name: Read the placeholder Publisher/identity out of AppxManifest.xml
+      - name: Azure login (federated / OIDC)
+        # Same pattern as build-and-release-windows.yml's `sign` job --
+        # skips cleanly if the secrets are absent (a fork, say) rather than
+        # failing the whole run.
+        if: ${{ env.AZURE_CLIENT_ID != '' }}
+        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign the widget provider exe (Azure Trusted Signing, same cert as the main app)
+        id: sign_provider_exe
+        if: ${{ env.AZURE_CLIENT_ID != '' }}
+        uses: azure/trusted-signing-action@1d365fec12862c4aa68fcac418143d73f0cea293 # v0
+        with:
+          azure-tenant-id: ${{ env.AZURE_TENANT_ID }}
+          azure-client-id: ${{ env.AZURE_CLIENT_ID }}
+          endpoint: https://eus.codesigning.azure.net/
+          trusted-signing-account-name: mlcsigning
+          certificate-profile-name: mlc-public-trust
+          files: ${{ github.workspace }}\windows\WidgetProvider\publish\MyLinedChartWidgetProvider.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Read the signing certificate's Subject + the provider's COM Class Id
         id: manifest
         shell: pwsh
         run: |
+          $sig = Get-AuthenticodeSignature windows\WidgetProvider\publish\MyLinedChartWidgetProvider.exe
+          if ($sig.Status -ne 'Valid') { throw "Provider exe is not validly signed ($($sig.Status)) -- refusing to derive a Publisher from it." }
+          $publisher = $sig.SignerCertificate.Subject
+          Write-Host "Real signing certificate Subject: $publisher"
+
           $xml = Get-Content windows\Package\AppxManifest.xml -Raw
-          if ($xml -notmatch '<Identity[^>]*Publisher="([^"]+)"') { throw "Could not find Identity/@Publisher in AppxManifest.xml" }
-          $publisher = $matches[1]
           if ($xml -notmatch '<Identity[^>]*Name="([^"]+)"') { throw "Could not find Identity/@Name in AppxManifest.xml" }
           $identityName = $matches[1]
           if ($xml -notmatch '<com:Class Id="([0-9A-Fa-f-]{36})"') { throw "Could not find the COM server Class Id in AppxManifest.xml" }
           $comClassId = $matches[1]
-          Write-Host "Publisher (from manifest): $publisher"
+          # Sanity check only, never fatal: the checked-in manifest carries a
+          # DOCUMENTED EXPECTED Publisher (see that file's own header) which
+          # this step's real certificate is meant to match exactly. A mismatch
+          # here means the doc drifted from the real cert, not that anything
+          # is broken -- the real certificate's Subject (read above) is always
+          # what actually gets used.
+          if ($xml -match '<Identity[^>]*Publisher="([^"]+)"' -and $matches[1] -ne $publisher) {
+            Write-Host "::warning::AppxManifest.xml's documented Publisher ('$($matches[1])') does not match the real signing certificate's Subject ('$publisher') -- update the checked-in value; the real certificate wins either way."
+          }
           Write-Host "Identity Name (from manifest): $identityName"
           Write-Host "COM Class Id (from manifest): $comClassId"
           "publisher=$publisher" >> $env:GITHUB_OUTPUT
           "identity_name=$identityName" >> $env:GITHUB_OUTPUT
           "com_class_id=$comClassId" >> $env:GITHUB_OUTPUT
 
-      - name: Generate + trust a CI-only self-signed test certificate
-        id: testcert
+      - name: Stamp AppxManifest.xml (Version from the app, Publisher from the real cert)
         shell: pwsh
         env:
           PUBLISHER_CN: ${{ steps.manifest.outputs.publisher }}
         run: |
-          # Matches Microsoft's own documented recipe for a sideloading test cert:
-          # https://learn.microsoft.com/windows/msix/package/create-certificate-package-signing
-          $cert = New-SelfSignedCertificate -Type Custom -Subject $env:PUBLISHER_CN `
-            -KeyUsage DigitalSignature -FriendlyName "MyLinedChart Widgets CI test cert (throwaway)" `
-            -CertStoreLocation "Cert:\CurrentUser\My" `
-            -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3", "2.5.29.19={text}")
-          Write-Host "Test cert thumbprint: $($cert.Thumbprint)"
-          "thumbprint=$($cert.Thumbprint)" >> $env:GITHUB_OUTPUT
-          Export-Certificate -Cert "Cert:\CurrentUser\My\$($cert.Thumbprint)" -FilePath ci-widget-test-cert.cer | Out-Null
-          Import-Certificate -FilePath ci-widget-test-cert.cer -CertStoreLocation Cert:\LocalMachine\TrustedPeople | Out-Null
-          Write-Host "Imported into LocalMachine\TrustedPeople."
-
-          # Best-effort: let a self-signed / Trusted-People-signed package
-          # install without full Developer Mode. Neither of these exists on a
-          # real customer machine and neither ships anywhere -- this only
-          # matters for THIS ephemeral runner installing a THROWAWAY test
-          # package. A real customer install uses Partner-Center-issued
-          # identity chained to a trusted CA, which needs none of this.
-          try {
-            New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Appx" -Force | Out-Null
-            Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Appx" -Name "AllowAllTrustedApps" -Value 1 -Type DWord
-            New-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock" -Force | Out-Null
-            Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock" -Name "AllowDevelopmentWithoutDevLicense" -Value 1 -Type DWord
-            Write-Host "Sideloading / trusted-apps policy set."
-          } catch {
-            Write-Host "::warning::Could not set sideloading policy: $($_.Exception.Message)"
-          }
+          node windows\Package\scripts\stamp-appx-identity.cjs --manifest windows\Package\AppxManifest.xml --publisher $env:PUBLISHER_CN
+          if ($LASTEXITCODE -ne 0) { throw "stamp-appx-identity.cjs failed with exit code $LASTEXITCODE" }
 
       - name: Pack the sparse MSIX
         shell: pwsh
@@ -210,23 +235,27 @@ jobs:
           $f = Get-Item windows\Package\dist\MyLinedChartWidgets.msix
           Write-Host ("PACKED: {0} ({1:N1} KB)" -f $f.FullName, ($f.Length/1KB))
 
-      - name: Sign the sparse MSIX
+      - name: Sign the sparse MSIX (Azure Trusted Signing, same cert as the main app)
+        if: ${{ env.AZURE_CLIENT_ID != '' }}
+        uses: azure/trusted-signing-action@1d365fec12862c4aa68fcac418143d73f0cea293 # v0
+        with:
+          azure-tenant-id: ${{ env.AZURE_TENANT_ID }}
+          azure-client-id: ${{ env.AZURE_CLIENT_ID }}
+          endpoint: https://eus.codesigning.azure.net/
+          trusted-signing-account-name: mlcsigning
+          certificate-profile-name: mlc-public-trust
+          files: ${{ github.workspace }}\windows\Package\dist\MyLinedChartWidgets.msix
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Verify the sparse MSIX signature
         shell: pwsh
-        env:
-          SIGNTOOL: ${{ steps.sdktools.outputs.signtool }}
-          THUMBPRINT: ${{ steps.testcert.outputs.thumbprint }}
         run: |
-          # Selected by thumbprint (/sha1), not by subject substring (/n) --
-          # /n takes a plain CN substring, not the full "CN=..." X.500 string
-          # this manifest's Publisher attribute carries (confirmed on real CI:
-          # "/n CN=TODO-from-partner-center" found no matching certificate),
-          # and a thumbprint is unambiguous regardless of how the subject is
-          # formatted.
-          & $env:SIGNTOOL sign /fd SHA256 /s My /sha1 $env:THUMBPRINT /v windows\Package\dist\MyLinedChartWidgets.msix
-          if ($LASTEXITCODE -ne 0) { throw "signtool sign failed with exit code $LASTEXITCODE" }
           $sig = Get-AuthenticodeSignature windows\Package\dist\MyLinedChartWidgets.msix
           Write-Host "Signature status: $($sig.Status)"
           Write-Host "Signer: $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') { throw "Sparse MSIX is not validly signed ($($sig.Status))" }
 
       # ============================================================
       # Step 3: prove Add-AppxPackage / Remove-AppxPackage directly,
@@ -418,12 +447,17 @@ jobs:
         shell: pwsh
         run: |
           Write-Host @"
-          PROVEN on this windows-latest runner, with a CI-only throwaway test certificate:
+          PROVEN on this windows-latest runner, signed with the REAL Azure Trusted Signing
+          certificate (mlcsigning / mlc-public-trust) -- the SAME cert that signs the main app's
+          own installer .exe, not a throwaway test certificate:
             - windows/WidgetProvider/MyLinedChartWidgetProvider.csproj builds against the REAL
               Microsoft.WindowsAppSDK / Windows.SDK.BuildTools packages via msbuild.
-            - windows/Package/AppxManifest.xml packs into a valid sparse MSIX (makeappx) and signs
-              (signtool).
-            - Add-AppxPackage / Remove-AppxPackage register and deregister it directly, and
+            - The provider exe and the packed sparse MSIX are both signed with that real cert, and
+              windows/Package/AppxManifest.xml's Identity/@Publisher was stamped from that same
+              certificate's actual Subject (never retyped, never guessed).
+            - Add-AppxPackage / Remove-AppxPackage register and deregister it directly, WITH NO
+              sideloading/developer-mode workaround needed (public-trust signing chains to a
+              publicly trusted root, exactly like the main app's own .exe already does), and
               Get-AppxPackageManifest confirms the registered package declares both the COM server
               (Class Id) and the com.microsoft.windows.widgets extension this provider needs.
             - The REAL windows-app NSIS installer (electron-builder.yml + installer-widget-provider.nsh)
@@ -440,8 +474,9 @@ jobs:
               process is killed/restarted.
 
           WHAT SETTLING THOSE NEEDS, on a real Windows 11 22H2+ PC (see windows/README.md's own
-          numbered list for the full detail): install the real MyLinedChart build once production
-          Partner Center identity replaces the placeholder and the sparse package is signed with the
-          SAME certificate as the main app installer, open the Widgets Board, add the watchlist
-          widget, and look.
+          numbered list for the full detail): install a real MyLinedChart build that carries this
+          provider (see build-and-release-windows.yml's own best-effort build-widget-provider job),
+          open the Widgets Board, add the watchlist widget, and look. Nothing here is blocked on
+          Partner Center any more -- see windows/Package/AppxManifest.xml's header for why a sparse
+          package never needed it in the first place.
           "@
