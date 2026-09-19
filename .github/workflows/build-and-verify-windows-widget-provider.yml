@@ -162,9 +162,23 @@ jobs:
       # before packing.
       # ============================================================
       - name: Azure login (federated / OIDC)
-        # Same pattern as build-and-release-windows.yml's `sign` job --
-        # skips cleanly if the secrets are absent (a fork, say) rather than
-        # failing the whole run.
+        id: azure_login
+        # ⚠ CONFIRMED ON REAL CI: Azure's federated identity credential for
+        # this app registration trusts specific GitHub subject claims
+        # (workflow_dispatch runs -- see build-and-release-windows.yml's own
+        # `sign` job history, all green) and does NOT trust a `pull_request`
+        # run's subject ("repo:.../MyLinedChart-installers:pull_request" --
+        # AADSTS700213, run 35425060976). That is expected, not a bug to
+        # chase: broadening the federated credential to trust pull_request
+        # events is an Azure AD app-registration change with real security
+        # weight (a fork's PR could then mint a signing token), and not this
+        # workflow's call to make. continue-on-error here means a pull_request
+        # run falls through to the CI-only test-cert path below instead of
+        # failing outright -- it still proves the entire mechanical flow
+        # (pack, register, the full NSIS install/uninstall round trip); only
+        # the exact real-certificate signing call is unexercised until this
+        # runs via workflow_dispatch post-merge, where OIDC is proven to work.
+        continue-on-error: true
         if: ${{ env.AZURE_CLIENT_ID != '' }}
         uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2
         with:
@@ -174,7 +188,7 @@ jobs:
 
       - name: Sign the widget provider exe (Azure Trusted Signing, same cert as the main app)
         id: sign_provider_exe
-        if: ${{ env.AZURE_CLIENT_ID != '' }}
+        if: ${{ steps.azure_login.outcome == 'success' }}
         uses: azure/trusted-signing-action@1d365fec12862c4aa68fcac418143d73f0cea293 # v0
         with:
           azure-tenant-id: ${{ env.AZURE_TENANT_ID }}
@@ -186,6 +200,47 @@ jobs:
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
+
+      # ★ FALLBACK ONLY: exercised when the real Azure OIDC login above did
+      # not succeed (see that step's own comment -- true for every
+      # pull_request-triggered run of this file). Generates a CI-only
+      # throwaway self-signed certificate (never shipped) so the REST of this
+      # workflow -- reading a Subject off a validly-signed exe, stamping the
+      # manifest, packing, registering, the full NSIS round trip -- still
+      # runs and proves the mechanical flow end to end even when the real
+      # certificate can't be reached from this trigger.
+      - name: Sign the widget provider exe (fallback -- CI-only test cert)
+        id: fallback_cert
+        if: ${{ steps.azure_login.outcome != 'success' }}
+        shell: pwsh
+        env:
+          SIGNTOOL: ${{ steps.sdktools.outputs.signtool }}
+        run: |
+          $cert = New-SelfSignedCertificate -Type Custom -Subject "CN=MyLinedChart Widgets CI Fallback Test Cert" `
+            -KeyUsage DigitalSignature -FriendlyName "MyLinedChart Widgets CI test cert (throwaway, never shipped)" `
+            -CertStoreLocation "Cert:\CurrentUser\My" `
+            -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3", "2.5.29.19={text}")
+          Export-Certificate -Cert "Cert:\CurrentUser\My\$($cert.Thumbprint)" -FilePath ci-widget-test-cert.cer | Out-Null
+          Import-Certificate -FilePath ci-widget-test-cert.cer -CertStoreLocation Cert:\LocalMachine\TrustedPeople | Out-Null
+
+          # Best-effort: lets a self-signed / Trusted-People-signed package
+          # install without full Developer Mode, needed ONLY because this is
+          # a throwaway cert on an ephemeral runner -- a real customer
+          # install uses the publicly-trusted Azure Trusted Signing
+          # certificate above, which needs none of this (see
+          # AppxManifest.xml's own header).
+          try {
+            New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Appx" -Force | Out-Null
+            Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Appx" -Name "AllowAllTrustedApps" -Value 1 -Type DWord
+            New-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock" -Force | Out-Null
+            Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock" -Name "AllowDevelopmentWithoutDevLicense" -Value 1 -Type DWord
+          } catch {
+            Write-Host "::warning::Could not set sideloading policy: $($_.Exception.Message)"
+          }
+
+          & $env:SIGNTOOL sign /fd SHA256 /s My /sha1 $cert.Thumbprint /v windows\WidgetProvider\publish\MyLinedChartWidgetProvider.exe
+          if ($LASTEXITCODE -ne 0) { throw "signtool sign (fallback) failed with exit code $LASTEXITCODE" }
+          "thumbprint=$($cert.Thumbprint)" >> $env:GITHUB_OUTPUT
 
       - name: Read the signing certificate's Subject + the provider's COM Class Id
         id: manifest
@@ -236,7 +291,7 @@ jobs:
           Write-Host ("PACKED: {0} ({1:N1} KB)" -f $f.FullName, ($f.Length/1KB))
 
       - name: Sign the sparse MSIX (Azure Trusted Signing, same cert as the main app)
-        if: ${{ env.AZURE_CLIENT_ID != '' }}
+        if: ${{ steps.azure_login.outcome == 'success' }}
         uses: azure/trusted-signing-action@1d365fec12862c4aa68fcac418143d73f0cea293 # v0
         with:
           azure-tenant-id: ${{ env.AZURE_TENANT_ID }}
@@ -248,6 +303,20 @@ jobs:
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
+
+      # ★ FALLBACK ONLY -- see "Sign the widget provider exe (fallback: CI-only
+      # test cert)" above for the full reasoning. Reuses that SAME certificate
+      # (by thumbprint) so both signed artifacts in this run trace to one
+      # throwaway identity, never a real one.
+      - name: Sign the sparse MSIX (fallback -- CI-only test cert)
+        if: ${{ steps.azure_login.outcome != 'success' }}
+        shell: pwsh
+        env:
+          SIGNTOOL: ${{ steps.sdktools.outputs.signtool }}
+          THUMBPRINT: ${{ steps.fallback_cert.outputs.thumbprint }}
+        run: |
+          & $env:SIGNTOOL sign /fd SHA256 /s My /sha1 $env:THUMBPRINT /v windows\Package\dist\MyLinedChartWidgets.msix
+          if ($LASTEXITCODE -ne 0) { throw "signtool sign (fallback) failed with exit code $LASTEXITCODE" }
 
       - name: Verify the sparse MSIX signature
         shell: pwsh

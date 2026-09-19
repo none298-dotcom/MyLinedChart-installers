@@ -22,6 +22,21 @@ on:
         description: "Release tag to publish the .exe under. 'latest' is what the WEBSITE links to — do not change it without changing the site too."
         default: "latest"
         required: true
+  # ★ TEST-ONLY, SCOPED TO build-widget-provider ALONE. workflow_dispatch
+  # cannot be run until this file lands on the default branch (see
+  # build-and-verify-windows-widget-provider.yml's own trigger comment for
+  # the confirmed 404 that motivates this same pattern here), but this file
+  # ships a brand-new job that needs a real run before anyone can trust it.
+  # `build`'s own `if:` below requires `github.event_name ==
+  # 'workflow_dispatch'`, so a pull_request-triggered run executes ONLY
+  # build-widget-provider and skips build/sign/publish entirely -- nothing
+  # here can build the main installer, sign anything with the production
+  # NSIS pipeline, or touch the public Release, no matter what this trigger
+  # fires on.
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/build-and-release-windows.yml"
 # ★ Security audit 2026-09-13 (SUPPLY-CHAIN-CI-01): permissions are granted per JOB, not to the
 # whole run. `npm ci` and electron-builder execute third-party code, so the build job gets read-only
 # contents and no OIDC token. Only the sign job can mint an Azure signing token, and only the publish
@@ -65,7 +80,10 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: none298-dotcom/MyLinedChart
-          ref: ${{ inputs.ref }}
+          # inputs.ref is unset on the test-only pull_request trigger (see
+          # this workflow's own `on:` comment) -- falls back to the branch
+          # this widget work actually lives on.
+          ref: ${{ inputs.ref || 'windows-watchlist-widget' }}
           token: ${{ secrets.PRIVATE_REPO_TOKEN }}
 
       - name: Setup .NET (pinned by windows/WidgetProvider/global.json)
