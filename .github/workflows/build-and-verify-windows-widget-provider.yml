@@ -445,3 +445,4 @@ jobs:
           SAME certificate as the main app installer, open the Widgets Board, add the watchlist
           widget, and look.
           "@
+# re-run: fixed NSIS $_ escaping (dab6ecc2)
