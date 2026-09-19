@@ -166,6 +166,7 @@ jobs:
           "com_class_id=$comClassId" >> $env:GITHUB_OUTPUT
 
       - name: Generate + trust a CI-only self-signed test certificate
+        id: testcert
         shell: pwsh
         env:
           PUBLISHER_CN: ${{ steps.manifest.outputs.publisher }}
@@ -177,6 +178,7 @@ jobs:
             -CertStoreLocation "Cert:\CurrentUser\My" `
             -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3", "2.5.29.19={text}")
           Write-Host "Test cert thumbprint: $($cert.Thumbprint)"
+          "thumbprint=$($cert.Thumbprint)" >> $env:GITHUB_OUTPUT
           Export-Certificate -Cert "Cert:\CurrentUser\My\$($cert.Thumbprint)" -FilePath ci-widget-test-cert.cer | Out-Null
           Import-Certificate -FilePath ci-widget-test-cert.cer -CertStoreLocation Cert:\LocalMachine\TrustedPeople | Out-Null
           Write-Host "Imported into LocalMachine\TrustedPeople."
@@ -212,9 +214,15 @@ jobs:
         shell: pwsh
         env:
           SIGNTOOL: ${{ steps.sdktools.outputs.signtool }}
-          PUBLISHER_CN: ${{ steps.manifest.outputs.publisher }}
+          THUMBPRINT: ${{ steps.testcert.outputs.thumbprint }}
         run: |
-          & $env:SIGNTOOL sign /fd SHA256 /s My /n $env:PUBLISHER_CN /v windows\Package\dist\MyLinedChartWidgets.msix
+          # Selected by thumbprint (/sha1), not by subject substring (/n) --
+          # /n takes a plain CN substring, not the full "CN=..." X.500 string
+          # this manifest's Publisher attribute carries (confirmed on real CI:
+          # "/n CN=TODO-from-partner-center" found no matching certificate),
+          # and a thumbprint is unambiguous regardless of how the subject is
+          # formatted.
+          & $env:SIGNTOOL sign /fd SHA256 /s My /sha1 $env:THUMBPRINT /v windows\Package\dist\MyLinedChartWidgets.msix
           if ($LASTEXITCODE -ne 0) { throw "signtool sign failed with exit code $LASTEXITCODE" }
           $sig = Get-AuthenticodeSignature windows\Package\dist\MyLinedChartWidgets.msix
           Write-Host "Signature status: $($sig.Status)"
@@ -437,5 +445,3 @@ jobs:
           SAME certificate as the main app installer, open the Widgets Board, add the watchlist
           widget, and look.
           "@
-# re-run: source repo pushed the makeappx placeholder fix (1f34db10)
-# re-run: fixed invalid XML comment (8e22e165)
