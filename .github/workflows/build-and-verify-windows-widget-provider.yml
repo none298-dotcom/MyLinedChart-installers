@@ -234,7 +234,10 @@ jobs:
         env:
           SIGNTOOL: ${{ steps.sdktools.outputs.signtool }}
         run: |
-          $cert = New-SelfSignedCertificate -Type Custom -Subject "CN=MyLinedChart Widgets CI Fallback Test Cert" `
+          # c1-windows-ai: same Subject string as the real certificate (never the
+          # real key), so the helper's embedded <msix> identity matches the stamped
+          # package and the Windows AI identity path is exercised on this runner.
+          $cert = New-SelfSignedCertificate -Type Custom -Subject "CN=Little Bird Trading LLC, O=Little Bird Trading LLC, L=Newark, S=Delaware, C=US" `
             -KeyUsage DigitalSignature -FriendlyName "MyLinedChart Widgets CI test cert (throwaway, never shipped)" `
             -CertStoreLocation "Cert:\CurrentUser\My" `
             -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3", "2.5.29.19={text}")
@@ -296,6 +299,11 @@ jobs:
         run: |
           node windows\Package\scripts\stamp-appx-identity.cjs --manifest windows\Package\AppxManifest.xml --publisher $env:PUBLISHER_CN
           if ($LASTEXITCODE -ne 0) { throw "stamp-appx-identity.cjs failed with exit code $LASTEXITCODE" }
+          if ($xmlText = Get-Content windows\Package\AppxManifest.xml -Raw) {
+            if ($xmlText -notmatch 'systemai:Capability Name="systemAIModels"') { throw "AppxManifest.xml lacks the systemAIModels capability" }
+          }
+          node windows\Package\scripts\check-identity-manifests.cjs
+          if ($LASTEXITCODE -ne 0) { throw "check-identity-manifests.cjs failed: the exe's <msix> identity does not match the stamped AppxManifest" }
 
       - name: Pack the sparse MSIX
         shell: pwsh
@@ -392,6 +400,35 @@ jobs:
             exit 1
           }
           Write-Host "Registered manifest contains the COM server Class Id ($($env:COM_CLASS_ID)) and the windows.widgets extension."
+
+      - name: Windows AI helper, directly registered (identity + status)
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path windows\WidgetProvider\publish\MyLinedChartWidgetProvider.exe).Path
+          function Invoke-Helper([string]$json) {
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $exe
+            $psi.Arguments = '--device-ai'
+            $psi.RedirectStandardInput = $true
+            $psi.RedirectStandardOutput = $true
+            $psi.UseShellExecute = $false
+            $p = [System.Diagnostics.Process]::Start($psi)
+            $p.StandardInput.Write($json); $p.StandardInput.Close()
+            $out = $p.StandardOutput.ReadToEnd()
+            if (-not $p.WaitForExit(30000)) { $p.Kill(); throw "helper did not exit within 30s for $json" }
+            Write-Host "helper $json -> $out (exit $($p.ExitCode))"
+            return ($out.Trim() | ConvertFrom-Json)
+          }
+          $id = Invoke-Helper '{"op":"identity"}'
+          $pkg = Get-AppxPackage -Name 'LittleBirdTrading.MyLinedChart.WidgetProvider'
+          Write-Host "Registered PackageFamilyName: $($pkg.PackageFamilyName)"
+          if (-not $id.ok) { throw "Directly launched helper has NO package identity: $($id | ConvertTo-Json -Compress)" }
+          if ($id.familyName -ne $pkg.PackageFamilyName) { throw "Helper identity $($id.familyName) != registered $($pkg.PackageFamilyName)" }
+          $st = Invoke-Helper '{"op":"status"}'
+          if ($st.ok -ne $true) { throw "status reply not ok: $($st | ConvertTo-Json -Compress)" }
+          Write-Host "Windows AI status on this runner: available=$($st.available) reason=$($st.reason)"
+          $ask = Invoke-Helper '{"op":"ask","prompt":"What is RSI?","facts":["RSI(14) is 55.2"]}'
+          if ($st.available -ne $true -and $ask.ok -eq $true) { throw "ask answered although status said unavailable" }
 
       - name: Remove the directly-registered package (clean slate before the installer test)
         shell: pwsh
@@ -494,6 +531,97 @@ jobs:
           Write-Host "Installer-side registration CONFIRMED:"
           Write-Host "  PackageFullName: $($pkg.PackageFullName)"
           Write-Host "  InstallLocation: $($pkg.InstallLocation)"
+
+      - name: Windows AI through the INSTALLED app (helper, chart round trip, Electron has no identity)
+        shell: pwsh
+        run: |
+          $roots = @("$env:ProgramFiles", "$env:LOCALAPPDATA\Programs", "${env:ProgramFiles(x86)}")
+          $appExe = $null
+          foreach ($r in $roots) {
+            if (-not (Test-Path $r)) { continue }
+            $hit = Get-ChildItem $r -Recurse -Filter 'MyLinedChart.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($hit) { $appExe = $hit.FullName; break }
+          }
+          if (-not $appExe) { throw "Installed MyLinedChart.exe not found" }
+          $installDir = Split-Path $appExe
+          $helper = Join-Path $installDir 'resources\widget-provider\MyLinedChartWidgetProvider.exe'
+          Write-Host "app: $appExe"
+          Write-Host "helper: $helper"
+
+          $psi = New-Object System.Diagnostics.ProcessStartInfo
+          $psi.FileName = $helper; $psi.Arguments = '--device-ai'
+          $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true; $psi.UseShellExecute = $false
+          $hp = [System.Diagnostics.Process]::Start($psi)
+          $hp.StandardInput.Write('{"op":"identity"}'); $hp.StandardInput.Close()
+          $idOut = $hp.StandardOutput.ReadToEnd(); $hp.WaitForExit(30000) | Out-Null
+          Write-Host "installed helper identity: $idOut"
+          if (-not ($idOut | ConvertFrom-Json).ok) { throw "Installed helper runs without package identity" }
+
+          Add-Type -TypeDefinition @"
+          using System;
+          using System.Runtime.InteropServices;
+          using System.Text;
+          public static class PkgId {
+            [DllImport("kernel32.dll")] public static extern int GetPackageFullName(IntPtr hProcess, ref uint len, StringBuilder name);
+            public static string Of(IntPtr h) {
+              uint len = 0;
+              int rc = GetPackageFullName(h, ref len, null);
+              if (rc == 15700) return "";
+              var sb = new StringBuilder((int)len);
+              rc = GetPackageFullName(h, ref len, sb);
+              return rc == 0 ? sb.ToString() : ("error " + rc);
+            }
+          }
+          "@
+
+          $stderrLog = Join-Path $PWD 'ai-app-stderr.log'
+          $env:ELECTRON_ENABLE_LOGGING = "1"
+          $app = Start-Process -FilePath $appExe -ArgumentList '--remote-debugging-port=9223' -PassThru -RedirectStandardError $stderrLog -RedirectStandardOutput (Join-Path $PWD 'ai-app-stdout.log')
+          $target = $null
+          $deadline = (Get-Date).AddSeconds(60)
+          while ((Get-Date) -lt $deadline -and -not $target) {
+            try {
+              $t = Invoke-RestMethod -Uri 'http://127.0.0.1:9223/json' -UseBasicParsing -TimeoutSec 3
+              $target = $t | Where-Object { $_.type -eq 'page' -and $_.url -like '*chart*' -and $_.webSocketDebuggerUrl } | Select-Object -First 1
+            } catch { }
+            if (-not $target) { Start-Sleep -Seconds 1 }
+          }
+          if (-not $target) { throw "No chart page target over CDP within 60s" }
+          Start-Sleep -Seconds 10
+
+          $appPkg = [PkgId]::Of($app.Handle)
+          Write-Host "Electron main process package identity: '$appPkg' (empty = none)"
+          if ($appPkg -ne '') { throw "The Electron app has package identity ($appPkg); only the helper may." }
+
+          $ws = New-Object System.Net.WebSockets.ClientWebSocket
+          $cts = New-Object System.Threading.CancellationTokenSource ([TimeSpan]::FromSeconds(60))
+          $ws.ConnectAsync([Uri]$target.webSocketDebuggerUrl, $cts.Token).GetAwaiter().GetResult()
+          $expr = '(window.MLCDeviceAi ? window.MLCDeviceAi.refresh().then(function(s){return JSON.stringify(s);}) : Promise.resolve("no MLCDeviceAi"))'
+          $cmd = @{ id = 4242; method = 'Runtime.evaluate'; params = @{ expression = $expr; returnByValue = $true; awaitPromise = $true } } | ConvertTo-Json -Depth 5 -Compress
+          $bytes = [System.Text.Encoding]::UTF8.GetBytes($cmd)
+          $ws.SendAsync((New-Object System.ArraySegment[byte] (, $bytes)), [System.Net.WebSockets.WebSocketMessageType]::Text, $true, $cts.Token).GetAwaiter().GetResult() | Out-Null
+          $value = $null
+          while (-not $value) {
+            $buf = New-Object byte[] 262144
+            $r = $ws.ReceiveAsync((New-Object System.ArraySegment[byte] (, $buf)), $cts.Token).GetAwaiter().GetResult()
+            $msg = [System.Text.Encoding]::UTF8.GetString($buf, 0, $r.Count) | ConvertFrom-Json
+            if ($msg.id -eq 4242) { $value = $msg.result.result.value; if (-not $value) { $value = ($msg | ConvertTo-Json -Depth 8 -Compress) } }
+          }
+          Write-Host "chart MLCDeviceAi.refresh() on the installed app: $value"
+          $status = $value | ConvertFrom-Json
+          if ($status.checked -ne $true) { throw "Chart never received a deviceAiStatus reply" }
+          if ($status.available -eq $true) { Write-Host "::notice::Windows AI reported AVAILABLE on this runner." }
+          elseif (-not $status.reason) { throw "Unavailable without a reason code" }
+
+          $protocol = Test-Path 'HKCU:\Software\Classes\mylinedchart'
+          Write-Host "mylinedchart:// protocol registered by the app: $protocol"
+          if (-not $protocol) { throw "mylinedchart:// protocol handler not registered" }
+          Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue
+          Get-Process MyLinedChart -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 3
+          $stderr = Get-Content $stderrLog -Raw -ErrorAction SilentlyContinue
+          if ($stderr -match '\[tray\] could not create') { throw "Tray icon failed to create: see stderr" }
+          Write-Host "Tray created without error (no '[tray] could not create' in stderr)."
 
       - name: Locate and run the uninstaller silently
         shell: pwsh
