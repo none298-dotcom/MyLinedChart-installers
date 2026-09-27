@@ -22,6 +22,10 @@ on:
         description: "Release tag to publish the .exe under. 'latest' is what the WEBSITE links to — do not change it without changing the site too."
         default: "latest"
         required: true
+      publish:
+        description: "Publish to the Release? 'false' = build + sign only (the signed .exe stays a run artifact) — for release candidates the owner has not approved yet."
+        default: "true"
+        required: true
   # ★ TEST-ONLY, SCOPED TO build-widget-provider ALONE. workflow_dispatch
   # cannot be run until this file lands on the default branch (see
   # build-and-verify-windows-widget-provider.yml's own trigger comment for
@@ -431,6 +435,7 @@ jobs:
           retention-days: 30
 
   publish:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish != 'false' }}
     needs: sign
     runs-on: ubuntu-latest
     permissions:
