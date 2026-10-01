@@ -329,12 +329,12 @@ jobs:
           $installedRoot = Split-Path $env:INSTALLED_EXE -Parent
           $bundledMsix = Join-Path $installedRoot 'resources\widget-provider\MyLinedChartWidgets.msix'
           if (-not (Test-Path $bundledMsix)) {
-            Write-Host "::warning::This build did not bundle a Widgets Board provider (no $bundledMsix) — best-effort, see build-and-release-windows.yml's build-widget-provider job. Skipping the registration check."
+            Write-Host "::warning::This build did not bundle a Widgets Board provider (no $bundledMsix) - best-effort, see build-and-release-windows.yml's build-widget-provider job. Skipping the registration check."
             exit 0
           }
-          Write-Host "Bundled sparse package found at $bundledMsix — expecting it to be registered."
-          if ([Environment]::OSVersion.Version.Build -lt 22000) {
-            Write-Host 'Widgets Board requires Windows 11; this older runner verifies the desktop app and Connector.'
+          Write-Host "Bundled sparse package found at $bundledMsix - expecting it to be registered."
+          if ([Environment]::OSVersion.Version.Build -lt 22000 -or (Get-CimInstance Win32_OperatingSystem).ProductType -ne 1) {
+            Write-Host 'Widgets Board requires Windows 11 client; this server/older runner verifies the desktop app and Connector.'
             exit 0
           }
           $pkg = Get-AppxPackage -Name 'LittleBirdTrading.MyLinedChart.WidgetProvider' -ErrorAction SilentlyContinue
