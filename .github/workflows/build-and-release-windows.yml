@@ -292,6 +292,9 @@ jobs:
           head -c 2 "$dest" | grep -q 'PK' || { echo "Downloaded file is not a zip (no PK header)"; head -c 200 "$dest"; exit 1; }
           echo "Connector staged: ${size} bytes"
 
+      - name: Verify Connector lifecycle and chart startup action
+        run: node windows-app/scripts/test-connector-startup.cjs
+
       - name: Build NSIS installer (.exe)
         working-directory: windows-app
         # predist:win extracts the bundled connector, then electron-builder makes the x64 NSIS installer

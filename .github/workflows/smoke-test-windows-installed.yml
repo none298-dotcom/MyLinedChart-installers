@@ -62,6 +62,10 @@ name: Smoke test INSTALLED Windows app
 on:
   workflow_dispatch:
     inputs:
+      source_ref:
+        description: "Source SHA containing the installed Connector verification script"
+        default: "main"
+        required: true
       exe_url:
         description: "Direct URL of the installer to test (defaults to the beta release asset; pass the Store edition's R2 url — dl.littlebirdtrading.com/windows/<ver>/store/MyLinedChart-Windows-Store-Setup.exe — together with is_store_edition: true to test that build)"
         # ★ `latest` is the only release tag now. The "beta" tag was retired on
@@ -94,6 +98,19 @@ jobs:
   installed-smoke:
     runs-on: ${{ inputs.runner || 'windows-latest' }}
     steps:
+      - name: Checkout Connector verification scripts
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: none298-dotcom/MyLinedChart
+          ref: ${{ inputs.source_ref || 'main' }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          path: source
+
+      - name: Setup Node for installed Connector checks
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
       - name: Report the runner OS
         shell: pwsh
         run: |
@@ -619,10 +636,22 @@ jobs:
           if (-not $alive) {
             Write-Host "::error::THE INSTALLED APP EXITED ON ITS OWN (exit code $($p.ExitCode)) - this reproduces the Store rejection."
           } else {
-            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            taskkill /pid $p.Id /T /F | Out-Null
           }
           "ALIVE=$alive" >> $env:GITHUB_ENV
           "FATAL=$fatal" >> $env:GITHUB_ENV
+
+      - name: Verify installed background Connector and real Start Connector button
+        if: ${{ !inputs.is_store_edition }}
+        shell: pwsh
+        env:
+          INSTALLED_EXE: ${{ steps.locate.outputs.exe }}
+        run: |
+          $resources = Join-Path (Split-Path $env:INSTALLED_EXE) 'resources\connector'
+          node source/windows-app/scripts/verify-packaged-connector.cjs $resources
+          if ($LASTEXITCODE -ne 0) { throw "Installed Connector runtime verification failed." }
+          node source/windows-app/scripts/verify-installed-connector.cjs $env:INSTALLED_EXE
+          if ($LASTEXITCODE -ne 0) { throw "Installed Connector startup/button verification failed." }
 
       - name: Windows Application event log (where a startup throw actually lands)
         id: eventlog
@@ -659,6 +688,9 @@ jobs:
             installed-app-after-signup-click.png
             installed-stdout.log
             installed-stderr.log
+            connector-installed-stdout.log
+            connector-installed-stderr.log
+            connector-installed-panel.png
           if-no-files-found: warn
           retention-days: 30
 
