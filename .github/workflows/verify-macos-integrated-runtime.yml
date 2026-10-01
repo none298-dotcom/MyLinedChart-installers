@@ -1,0 +1,62 @@
+name: Verify signed Mac integrated runtime
+on:
+  workflow_dispatch:
+    inputs:
+      dmg_url:
+        required: true
+        type: string
+      sha256:
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  intel-runtime:
+    runs-on: macos-15-intel
+    steps:
+      - name: Download and verify immutable release
+        env:
+          DMG_URL: ${{ inputs.dmg_url }}
+          DMG_SHA: ${{ inputs.sha256 }}
+        run: |
+          curl --fail --location "$DMG_URL" -o release.dmg
+          echo "$DMG_SHA  release.dmg" | shasum -a 256 -c -
+          xcrun stapler validate release.dmg
+          hdiutil attach release.dmg -readonly -nobrowse -mountpoint /tmp/mlc-release
+          ditto /tmp/mlc-release/MyLinedChart.app /tmp/MyLinedChart.app
+          hdiutil detach /tmp/mlc-release
+          codesign --verify --deep --strict /tmp/MyLinedChart.app
+          spctl --assess --type execute --verbose /tmp/MyLinedChart.app
+      - name: Exercise native Intel Python and headless helper
+        run: |
+          set -euo pipefail
+          app=/tmp/MyLinedChart.app
+          "$app/Contents/Resources/Connector/python-x86_64/bin/python3.11" -c 'import platform, numpy, cryptography, cffi, ib_insync; assert platform.machine() == "x86_64"; print("Intel runtime imports passed")'
+          "$app/Contents/MacOS/MyLinedChartIBKRHelper" --headless > helper.log 2>&1 &
+          helper_pid=$!
+          export HELPER_PID=$helper_pid
+          /usr/bin/python3 - <<'PY'
+          import os,time,pathlib,json,urllib.request,subprocess
+          root=pathlib.Path.home()/'Library/Application Support/MyLinedChart/IBKRConnector'
+          deadline=time.time()+45
+          while time.time()<deadline:
+              if subprocess.run(['kill','-0',os.environ['HELPER_PID']],capture_output=True).returncode:
+                  raise RuntimeError('Integrated helper exited before readiness')
+              try:
+                  state=json.loads((root/'bridge-token.json').read_text())
+                  token=state['token'];port=int(state['port'])
+                  req=urllib.request.Request(f'http://127.0.0.1:{port}/health',headers={'Authorization':'Bearer '+token})
+                  with urllib.request.urlopen(req,timeout=2) as r: body=json.load(r)
+                  assert body.get('ok') is True
+                  print('Protected helper health passed:',body.get('version'))
+                  break
+              except Exception:time.sleep(1)
+          else:raise RuntimeError('Integrated helper never became ready')
+          PY
+          kill -TERM "$helper_pid"
+          wait "$helper_pid"
+          sleep 2
+          if pgrep -f '^/tmp/MyLinedChart.app/Contents/Resources/Connector/python-x86_64/bin/python3.11' ; then
+            echo 'Owned bridge remained after helper quit'; exit 1
+          fi
+          codesign --verify --deep --strict "$app"
