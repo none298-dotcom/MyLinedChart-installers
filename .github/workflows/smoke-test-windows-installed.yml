@@ -62,6 +62,10 @@ name: Smoke test INSTALLED Windows app
 on:
   workflow_dispatch:
     inputs:
+      upgrade_from_url:
+        description: "Optional signed prior installer URL to verify upgrade instead of fresh install"
+        default: ""
+        required: false
       source_ref:
         description: "Source SHA containing the installed Connector verification script"
         default: "main"
@@ -137,7 +141,22 @@ jobs:
           Write-Host "signer : $($sig.SignerCertificate.Subject)"
           # Not fatal: an unsigned build is still worth crash-testing, and the
           # signing status is checked properly by the release workflow.
-          if ($sig.Status -ne 'Valid') { Write-Host "::warning::signature is $($sig.Status)" }
+          if ($sig.Status -ne 'Valid') { throw "Installer signature is $($sig.Status)" }
+
+      - name: Install prior version for upgrade verification
+        if: ${{ inputs.upgrade_from_url != '' }}
+        shell: pwsh
+        env:
+          PRIOR_URL: ${{ inputs.upgrade_from_url }}
+        run: |
+          Invoke-WebRequest -Uri $env:PRIOR_URL -OutFile prior-setup.exe
+          $sig = Get-AuthenticodeSignature .\prior-setup.exe
+          if ($sig.Status -ne 'Valid') { throw "Prior installer signature is $($sig.Status)" }
+          $p = Start-Process -FilePath .\prior-setup.exe -ArgumentList '/S' -PassThru -Wait
+          if ($p.ExitCode -ne 0) { throw "Prior install failed: $($p.ExitCode)" }
+          $support = Join-Path $env:APPDATA 'MyLinedChart'
+          New-Item -ItemType Directory -Path $support -Force | Out-Null
+          Set-Content (Join-Path $support 'upgrade-preservation-check.txt') 'preserved through upgrade'
 
       - name: Silent install (exactly what the Store certifier runs)
         shell: pwsh
@@ -147,6 +166,13 @@ jobs:
           $p = Start-Process -FilePath .\setup.exe -ArgumentList '/S' -PassThru -Wait
           Write-Host "installer exit code: $($p.ExitCode)"
           if ($p.ExitCode -ne 0) { throw "Silent install failed with exit code $($p.ExitCode)" }
+
+      - name: Verify upgrade preserves application support data
+        if: ${{ inputs.upgrade_from_url != '' }}
+        shell: pwsh
+        run: |
+          $marker = Join-Path $env:APPDATA 'MyLinedChart\upgrade-preservation-check.txt'
+          if ((Get-Content $marker -Raw).Trim() -ne 'preserved through upgrade') { throw 'Upgrade removed application support data.' }
 
       # ★★ The two things Microsoft certification actually checks. Added after
       # the 2026-08-03 rejection, which failed BOTH:
