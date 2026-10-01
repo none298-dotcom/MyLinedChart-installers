@@ -246,6 +246,11 @@ jobs:
           $roots = @("$env:LOCALAPPDATA\Programs", "$env:ProgramFiles", "${env:ProgramFiles(x86)}")
           $exe = $null
           foreach ($r in $roots) {
+            $candidate = Join-Path $r 'MyLinedChart\MyLinedChart.exe'
+            if (Test-Path $candidate) { $exe = $candidate; break }
+          }
+          foreach ($r in $roots) {
+            if ($exe) { break }
             if (-not (Test-Path $r)) { continue }
             $hit = Get-ChildItem $r -Recurse -Filter 'MyLinedChart.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
             if ($hit) { $exe = $hit.FullName; break }
@@ -317,7 +322,7 @@ jobs:
       # build-and-verify-windows-widget-provider.yml; this is the one check
       # that watches it stay true on the artifact this workflow actually ships.
       - name: Assert the Widgets Board provider registered, if this build bundled one
-        shell: pwsh
+        shell: powershell
         env:
           INSTALLED_EXE: ${{ steps.locate.outputs.exe }}
         run: |
@@ -328,6 +333,10 @@ jobs:
             exit 0
           }
           Write-Host "Bundled sparse package found at $bundledMsix — expecting it to be registered."
+          if ([Environment]::OSVersion.Version.Build -lt 22000) {
+            Write-Host 'Widgets Board requires Windows 11; this older runner verifies the desktop app and Connector.'
+            exit 0
+          }
           $pkg = Get-AppxPackage -Name 'LittleBirdTrading.MyLinedChart.WidgetProvider' -ErrorAction SilentlyContinue
           if (-not $pkg) {
             Write-Host "::error::The installer bundled a Widgets Board provider but Get-AppxPackage does not show it registered. installer-widget-provider.nsh's customInstall macro did not succeed on this install."
@@ -668,16 +677,20 @@ jobs:
           "FATAL=$fatal" >> $env:GITHUB_ENV
 
       - name: Verify installed background Connector and real Start Connector button
-        if: ${{ !inputs.is_store_edition }}
         shell: pwsh
         env:
           INSTALLED_EXE: ${{ steps.locate.outputs.exe }}
+          IS_STORE_EDITION: ${{ inputs.is_store_edition }}
         run: |
-          $resources = Join-Path (Split-Path $env:INSTALLED_EXE) 'resources\connector'
-          node source/windows-app/scripts/verify-packaged-connector.cjs $resources
-          if ($LASTEXITCODE -ne 0) { throw "Installed Connector runtime verification failed." }
-          node source/windows-app/scripts/verify-installed-connector.cjs $env:INSTALLED_EXE
-          if ($LASTEXITCODE -ne 0) { throw "Installed Connector startup/button verification failed." }
+          if ($env:IS_STORE_EDITION -eq 'true') {
+            node source/windows-app/scripts/verify-installed-connector.cjs $env:INSTALLED_EXE --store
+          } else {
+            $resources = Join-Path (Split-Path $env:INSTALLED_EXE) 'resources\connector'
+            node source/windows-app/scripts/verify-packaged-connector.cjs $resources
+            if ($LASTEXITCODE -ne 0) { throw "Installed Connector runtime verification failed." }
+            node source/windows-app/scripts/verify-installed-connector.cjs $env:INSTALLED_EXE
+          }
+          if ($LASTEXITCODE -ne 0) { throw "Installed edition/Connector verification failed." }
 
       - name: Windows Application event log (where a startup throw actually lands)
         id: eventlog
