@@ -45,7 +45,7 @@ jobs:
               try:
                   state=json.loads((root/'bridge-token.json').read_text())
                   token=state['token'];port=int(state['port'])
-                  req=urllib.request.Request(f'http://127.0.0.1:{port}/health',headers={'Authorization':'Bearer '+token})
+                  req=urllib.request.Request(f'http://127.0.0.1:{port}/active-provider',headers={'X-MLC-Token':token})
                   with urllib.request.urlopen(req,timeout=2) as r: body=json.load(r)
                   assert body.get('ok') is True
                   print('Protected helper health passed:',body.get('version'))
