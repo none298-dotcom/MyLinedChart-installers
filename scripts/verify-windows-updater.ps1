@@ -9,7 +9,11 @@ function Find-Control([string]$Name) {
   } catch {
     # Restart replaces the app and installer windows while we enumerate them.
     # Retry from RootElement on the next bounded poll; preserve other failures.
-    if ($_.Exception.GetBaseException() -is [System.Windows.Automation.ElementNotAvailableException]) { return $null }
+    $cause=$_.Exception.GetBaseException()
+    if ($cause -is [System.Windows.Automation.ElementNotAvailableException] -or $cause.HResult -eq -2147418113) {
+      Write-Host "Transient UI Automation lookup while windows change: $($cause.GetType().Name)"
+      return $null
+    }
     throw
   }
 }
@@ -84,5 +88,15 @@ while ((Get-Date) -lt $deadline) {
  $running=Get-Process MyLinedChart -ErrorAction SilentlyContinue | Where-Object {$_.Path -eq $exe}
  if ($running) { break }; Start-Sleep -Seconds 2
 }
-if (!$running) { throw 'Updated app did not relaunch' }
+if (!$running) {
+ Add-Type -AssemblyName System.Drawing
+ Add-Type -AssemblyName System.Windows.Forms
+ $bounds=[System.Windows.Forms.SystemInformation]::VirtualScreen
+ $shot=[System.Drawing.Bitmap]::new($bounds.Width,$bounds.Height)
+ $graphics=[System.Drawing.Graphics]::FromImage($shot)
+ $graphics.CopyFromScreen($bounds.Left,$bounds.Top,0,0,$shot.Size)
+ $shot.Save((Join-Path $PWD 'updater-relaunch.png'))
+ $graphics.Dispose();$shot.Dispose()
+ throw 'Updated app did not relaunch'
+}
 Write-Host "PASS: shipped prior $old updater downloaded, installed and relaunched $version from the public update feed"
