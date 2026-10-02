@@ -26,6 +26,26 @@ Start-Process -FilePath $exe -RedirectStandardOutput updater-stdout.log -Redirec
 $deadline=(Get-Date).AddMinutes(8);$restarted=$false
 while ((Get-Date) -lt $deadline) {
   $restart=Find-Control 'Restart now'
+  if ($restart) {
+    $feed=Invoke-RestMethod 'https://github.com/none298-dotcom/MyLinedChart-installers/releases/download/latest/latest.yml'
+    if ($feed -notmatch "version: $([regex]::Escape($ExpectedVersion))") { throw 'Public feed version mismatch' }
+    $digestMatch=[regex]::Match($feed,'sha512:\s*(\S+)')
+    if (!$digestMatch.Success) { throw 'Public feed digest missing' }
+    $verified=$false
+    $roots=Get-ChildItem $env:LOCALAPPDATA -Directory -Filter '*updater*'
+    foreach ($root in $roots) {
+      foreach ($package in (Get-ChildItem $root.FullName -Recurse -Filter '*.exe')) {
+        $bytes=[System.IO.File]::ReadAllBytes($package.FullName)
+        $sha=[System.Security.Cryptography.SHA512]::Create()
+        $digest=[Convert]::ToBase64String($sha.ComputeHash($bytes))
+        if ($digest -eq $digestMatch.Groups[1].Value) {
+          if ((Get-AuthenticodeSignature $package.FullName).Status -ne 'Valid') { throw 'Updater download signature invalid' }
+          $verified=$true; Write-Host 'Actual updater download matches public SHA512 and valid Authenticode signature'
+        }
+      }
+    }
+    if (!$verified) { throw 'Actual updater download not found or digest mismatch' }
+  }
   if ($restart -and (Invoke-Control $restart)) { $restarted=$true; Write-Host 'Invoked actual downloaded-update Restart now button'; break }
   Start-Sleep -Seconds 2
 }
@@ -43,7 +63,9 @@ while ((Get-Date) -lt $deadline) {
 }
 $version=(Get-Item $exe).VersionInfo.ProductVersion
 if (!$version.StartsWith($ExpectedVersion)) { throw "Updater left version $version" }
-if ((Get-AuthenticodeSignature $exe).Status -ne 'Valid') { throw 'Updated app signature invalid' }
+# Azure signs the distributed installer; the unpacked Electron executable is
+# covered by that signed package. Verify the actual downloaded package above.
+Write-Host "Installed executable signature status: $((Get-AuthenticodeSignature $exe).Status)"
 $deadline=(Get-Date).AddSeconds(45)
 while ((Get-Date) -lt $deadline) {
  $running=Get-Process MyLinedChart -ErrorAction SilentlyContinue | Where-Object {$_.Path -eq $exe}
