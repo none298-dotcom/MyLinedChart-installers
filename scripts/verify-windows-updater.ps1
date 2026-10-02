@@ -75,6 +75,12 @@ if (!$version.StartsWith($ExpectedVersion)) { throw "Updater left version $versi
 Write-Host "Installed executable signature status: $((Get-AuthenticodeSignature $exe).Status)"
 $deadline=(Get-Date).AddSeconds(45)
 while ((Get-Date) -lt $deadline) {
+ # NSIS can write the new version before its Finish page is dismissed. Keep
+ # driving ordinary wizard controls until the updater's requested relaunch.
+ foreach ($name in @('Next >','&Next >','Install','&Install','Finish','&Finish','Yes')) {
+   $control=Find-Control $name
+   if ($control) { Invoke-Control $control | Out-Null }
+ }
  $running=Get-Process MyLinedChart -ErrorAction SilentlyContinue | Where-Object {$_.Path -eq $exe}
  if ($running) { break }; Start-Sleep -Seconds 2
 }
