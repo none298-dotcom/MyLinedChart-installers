@@ -672,6 +672,10 @@ jobs:
             Write-Host "::error::THE INSTALLED APP EXITED ON ITS OWN (exit code $($p.ExitCode)) - this reproduces the Store rejection."
           } else {
             taskkill /pid $p.Id /T /F | Out-Null
+            # Electron children can exit between enumeration and taskkill.
+            # Cleanup's "no running instance" must not override the explicit
+            # liveness/auth assertions in the final verification step.
+            $global:LASTEXITCODE = 0
           }
           "ALIVE=$alive" >> $env:GITHUB_ENV
           "FATAL=$fatal" >> $env:GITHUB_ENV
