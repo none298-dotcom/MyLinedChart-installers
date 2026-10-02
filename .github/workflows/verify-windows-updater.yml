@@ -30,4 +30,6 @@ jobs:
         if: always()
         with:
           name: windows-updater-evidence
-          path: updater-*.log
+          path: |
+            updater-*.log
+            updater-*.png

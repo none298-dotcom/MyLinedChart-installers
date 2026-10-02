@@ -4,7 +4,18 @@ Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 function Find-Control([string]$Name) {
   $condition=[System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty,$Name)
-  return [System.Windows.Automation.AutomationElement]::RootElement.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$condition)
+  try {
+    return [System.Windows.Automation.AutomationElement]::RootElement.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$condition)
+  } catch {
+    # Restart replaces the app and installer windows while we enumerate them.
+    # Retry from RootElement on the next bounded poll; preserve other failures.
+    $cause=$_.Exception.GetBaseException()
+    if ($cause -is [System.Windows.Automation.ElementNotAvailableException] -or $cause.HResult -eq -2147418113) {
+      Write-Host "Transient UI Automation lookup while windows change: $($cause.GetType().Name)"
+      return $null
+    }
+    throw
+  }
 }
 function Invoke-Control($Control) {
   if (!$Control) { return $false }
@@ -68,8 +79,24 @@ if (!$version.StartsWith($ExpectedVersion)) { throw "Updater left version $versi
 Write-Host "Installed executable signature status: $((Get-AuthenticodeSignature $exe).Status)"
 $deadline=(Get-Date).AddSeconds(45)
 while ((Get-Date) -lt $deadline) {
+ # NSIS can write the new version before its Finish page is dismissed. Keep
+ # driving ordinary wizard controls until the updater's requested relaunch.
+ foreach ($name in @('Next >','&Next >','Install','&Install','Finish','&Finish','Yes')) {
+   $control=Find-Control $name
+   if ($control) { Invoke-Control $control | Out-Null }
+ }
  $running=Get-Process MyLinedChart -ErrorAction SilentlyContinue | Where-Object {$_.Path -eq $exe}
  if ($running) { break }; Start-Sleep -Seconds 2
 }
-if (!$running) { throw 'Updated app did not relaunch' }
+if (!$running) {
+ Add-Type -AssemblyName System.Drawing
+ Add-Type -AssemblyName System.Windows.Forms
+ $bounds=[System.Windows.Forms.SystemInformation]::VirtualScreen
+ $shot=[System.Drawing.Bitmap]::new($bounds.Width,$bounds.Height)
+ $graphics=[System.Drawing.Graphics]::FromImage($shot)
+ $graphics.CopyFromScreen($bounds.Left,$bounds.Top,0,0,$shot.Size)
+ $shot.Save((Join-Path $PWD 'updater-relaunch.png'))
+ $graphics.Dispose();$shot.Dispose()
+ throw 'Updated app did not relaunch'
+}
 Write-Host "PASS: shipped prior $old updater downloaded, installed and relaunched $version from the public update feed"
