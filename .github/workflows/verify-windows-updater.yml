@@ -1,0 +1,33 @@
+name: Verify shipped Windows updater
+on:
+  workflow_dispatch:
+    inputs:
+      prior_url:
+        required: true
+        type: string
+      prior_sha256:
+        required: true
+        type: string
+      expected_version:
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  update-installed-app:
+    runs-on: windows-latest
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Exercise actual installed updater against public feed
+        shell: pwsh
+        env:
+          PRIOR_URL: ${{ inputs.prior_url }}
+          PRIOR_SHA: ${{ inputs.prior_sha256 }}
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
+        run: ./scripts/verify-windows-updater.ps1 -PriorUrl $env:PRIOR_URL -PriorSha256 $env:PRIOR_SHA -ExpectedVersion $env:EXPECTED_VERSION
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: windows-updater-evidence
+          path: updater-*.log
