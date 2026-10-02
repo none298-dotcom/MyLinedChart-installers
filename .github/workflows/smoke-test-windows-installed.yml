@@ -734,6 +734,9 @@ jobs:
             connector-installed-stdout.log
             connector-installed-stderr.log
             connector-installed-panel.png
+            connector-installed-live-feed.png
+            store-current-chart.png
+            store-current-export.png
           if-no-files-found: warn
           retention-days: 30
 
