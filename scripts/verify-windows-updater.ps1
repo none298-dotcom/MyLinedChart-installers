@@ -4,7 +4,14 @@ Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 function Find-Control([string]$Name) {
   $condition=[System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty,$Name)
-  return [System.Windows.Automation.AutomationElement]::RootElement.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$condition)
+  try {
+    return [System.Windows.Automation.AutomationElement]::RootElement.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$condition)
+  } catch {
+    # Restart replaces the app and installer windows while we enumerate them.
+    # Retry from RootElement on the next bounded poll; preserve other failures.
+    if ($_.Exception.GetBaseException() -is [System.Windows.Automation.ElementNotAvailableException]) { return $null }
+    throw
+  }
 }
 function Invoke-Control($Control) {
   if (!$Control) { return $false }
