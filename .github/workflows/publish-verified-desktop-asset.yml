@@ -1,0 +1,64 @@
+name: Publish verified desktop asset
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Desktop version, such as 1.0.68
+        required: true
+        type: string
+      platform:
+        description: Installer platform
+        required: true
+        type: choice
+        options: [windows, macos]
+      sha256:
+        description: SHA256 of the verified signed installer
+        required: true
+        type: string
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download and verify the immutable artifact
+        env:
+          VERSION: ${{ inputs.version }}
+          PLATFORM: ${{ inputs.platform }}
+          SHA256: ${{ inputs.sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$SHA256" =~ ^[a-f0-9]{64}$ ]]
+          case "$PLATFORM" in
+            windows)
+              asset="MyLinedChart-Windows-Setup-$VERSION.exe"
+              source="https://dl.littlebirdtrading.com/windows/$VERSION/MyLinedChart-Windows-Setup.exe"
+              ;;
+            macos)
+              asset="MyLinedChart-$VERSION.dmg"
+              source="https://dl.littlebirdtrading.com/macos/$VERSION/MyLinedChart.dmg"
+              ;;
+            *) exit 1 ;;
+          esac
+          curl --fail --location --retry 5 --retry-all-errors "$source" -o "$RUNNER_TEMP/$asset"
+          printf '%s  %s\n' "$SHA256" "$RUNNER_TEMP/$asset" | sha256sum --check
+          printf 'ASSET=%s\nSHA256=%s\n' "$asset" "$SHA256" >> "$GITHUB_ENV"
+      - name: Publish without replacing an existing installer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          existing=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/latest" --jq ".assets[] | select(.name==\"$ASSET\") | .digest")
+          if [ -n "$existing" ]; then
+            test "$existing" = "sha256:$SHA256"
+            echo 'The identical installer is already published.'
+            exit 0
+          fi
+          gh release upload latest "$RUNNER_TEMP/$ASSET" --repo "$GITHUB_REPOSITORY"
+          actual=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/latest" --jq ".assets[] | select(.name==\"$ASSET\") | .digest")
+          test "$actual" = "sha256:$SHA256"
+          echo 'Published installer digest matches the verified file.'
