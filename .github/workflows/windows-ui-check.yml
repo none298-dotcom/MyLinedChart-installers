@@ -1,0 +1,91 @@
+name: Windows UI check
+# Runs the Windows app from a private-repo ref, drives it over the DevTools
+# protocol with the given steps, and screenshots after each step. Test only.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Private-repo branch/tag/SHA"
+        default: "main"
+        required: true
+      steps_json:
+        description: 'JSON array of {"name","js","wait"} run in the chart page in order'
+        required: true
+permissions:
+  contents: read
+jobs:
+  ui:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: none298-dotcom/MyLinedChart
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - name: Install
+        working-directory: windows-app
+        shell: pwsh
+        run: |
+          npm ci
+          if (Test-Path node_modules\.bin\install-electron.cmd) { npx install-electron --no }
+      - name: Drive and screenshot
+        working-directory: windows-app
+        shell: pwsh
+        env:
+          STEPS_JSON: ${{ inputs.steps_json }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          New-Item -ItemType Directory -Force shots | Out-Null
+          Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+          function Shot($name) {
+            $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+            $bmp.Save((Join-Path $PWD "shots\$name.png"), [System.Drawing.Imaging.ImageFormat]::Png)
+            $g.Dispose(); $bmp.Dispose()
+          }
+          function Eval($url, $expr) {
+            $ws = New-Object System.Net.WebSockets.ClientWebSocket
+            $cts = New-Object System.Threading.CancellationTokenSource ([TimeSpan]::FromSeconds(30))
+            $ws.ConnectAsync([Uri]$url, $cts.Token).GetAwaiter().GetResult()
+            $cmd = @{ id = 9001; method = 'Runtime.evaluate'; params = @{ expression = $expr; returnByValue = $true; awaitPromise = $true } } | ConvertTo-Json -Depth 10 -Compress
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($cmd)
+            $ws.SendAsync((New-Object System.ArraySegment[byte] (, $bytes)), 'Text', $true, $cts.Token).GetAwaiter().GetResult() | Out-Null
+            $deadline = (Get-Date).AddSeconds(30)
+            while ((Get-Date) -lt $deadline) {
+              $buf = New-Object byte[] 1048576
+              $r = $ws.ReceiveAsync((New-Object System.ArraySegment[byte] (, $buf)), $cts.Token).GetAwaiter().GetResult()
+              $t = [System.Text.Encoding]::UTF8.GetString($buf, 0, $r.Count)
+              if ($t) { $m = $t | ConvertFrom-Json; if ($m.id -eq 9001) { $ws.Dispose(); return ($m.result.result.value | Out-String).Trim() } }
+            }
+            $ws.Dispose(); return 'timeout'
+          }
+          $electron = Join-Path $PWD 'node_modules\electron\dist\electron.exe'
+          $p = Start-Process -FilePath $electron -ArgumentList '.','--remote-debugging-port=9222' -PassThru -RedirectStandardOutput shots\stdout.log -RedirectStandardError shots\stderr.log
+          Start-Sleep -Seconds 40
+          $target = $null
+          for ($i = 0; $i -lt 30 -and -not $target; $i++) {
+            try { $target = (Invoke-RestMethod http://127.0.0.1:9222/json) | Where-Object { $_.type -eq 'page' -and $_.url -like '*chart*' } | Select-Object -First 1 } catch {}
+            if (-not $target) { Start-Sleep 2 }
+          }
+          Shot '00-start'
+          $steps = $env:STEPS_JSON | ConvertFrom-Json
+          $n = 1
+          foreach ($s in $steps) {
+            $out = if ($target) { Eval $target.webSocketDebuggerUrl $s.js } else { 'no devtools target' }
+            "$n $($s.name): $out" | Tee-Object -Append shots\results.txt
+            Start-Sleep -Seconds ([int]($s.wait | ForEach-Object { if ($_) { $_ } else { 3 } }))
+            Shot ('{0:D2}-{1}' -f $n, $s.name)
+            $n++
+          }
+          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: windows-ui
+          path: windows-app/shots
