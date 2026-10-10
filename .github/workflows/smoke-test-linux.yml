@@ -8,6 +8,10 @@ on:
         description: "Private-repo branch/tag/SHA to build"
         default: "main"
         required: true
+      steps_json:
+        description: 'Optional JSON array of {"name","js","wait"} run in the chart page in order'
+        required: false
+        default: ""
 permissions:
   contents: read
 jobs:
@@ -34,8 +38,49 @@ jobs:
           node scripts/write-store-edition-flag.js store
           npx electron-builder --config electron-builder.linux.yml --linux AppImage --x64 --publish never
           ls -la dist-linux
+      - name: Write step driver
+        if: ${{ inputs.steps_json != '' }}
+        run: |
+          cat > .github-steps.mjs <<'JS'
+          // Runs each step in the chart page over DevTools and screenshots the screen after it.
+          import { execSync } from "node:child_process";
+          import fs from "node:fs";
+          const steps = JSON.parse(process.env.STEPS_JSON);
+          const sleep = ms => new Promise(r => setTimeout(r, ms));
+          async function target() {
+            for (let i = 0; i < 30; i++) {
+              try {
+                const list = await (await fetch("http://127.0.0.1:9222/json")).json();
+                const t = list.find(x => x.type === "page" && /chart/.test(x.url));
+                if (t) return t.webSocketDebuggerUrl;
+              } catch {}
+              await sleep(1000);
+            }
+            throw new Error("no chart page");
+          }
+          async function evaluate(expr) {
+            const ws = new WebSocket(await target());
+            await new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
+            const out = await new Promise(res => {
+              ws.onmessage = m => { const d = JSON.parse(m.data); if (d.id === 1) res(d.result?.result?.value ?? JSON.stringify(d.result?.exceptionDetails?.text || d.error || null)); };
+              ws.send(JSON.stringify({ id: 1, method: "Runtime.evaluate", params: { expression: expr, returnByValue: true, awaitPromise: true } }));
+              setTimeout(() => res("timeout"), 30000);
+            });
+            ws.close();
+            return out;
+          }
+          for (const step of steps) {
+            let value;
+            try { value = await evaluate(step.js); } catch (e) { value = "error: " + e.message; }
+            fs.appendFileSync("shots/steps.txt", `${step.name}: ${value}\n`);
+            await sleep((Number(step.wait) || 2) * 1000);
+            try { execSync(`import -window root shots/${step.name}.png`); } catch {}
+          }
+          JS
       - name: Launch and screenshot
         working-directory: windows-app
+        env:
+          STEPS_JSON: ${{ inputs.steps_json }}
         run: |
           APP=$(ls dist-linux/*.AppImage | head -1)
           chmod +x "$APP"
@@ -43,12 +88,13 @@ jobs:
           Xvfb :99 -screen 0 1600x1000x24 &
           sleep 2
           export DISPLAY=:99
-          "$APP" --no-sandbox > shots/stdout.log 2> shots/stderr.log &
+          "$APP" --no-sandbox --remote-debugging-port=9222 > shots/stdout.log 2> shots/stderr.log &
           PID=$!
           for t in 20 45 75; do
             sleep $(( t - ${LAST:-0} )); LAST=$t
             import -window root shots/linux-${t}s.png || true
           done
+          if [ -n "$STEPS_JSON" ]; then node ../.github-steps.mjs || true; fi
           xwininfo -root -tree | grep -i mylinedchart > shots/windows.txt || true
           if kill -0 $PID 2>/dev/null; then echo "ALIVE after 75s" | tee shots/result.txt; else echo "EXITED" | tee shots/result.txt; fi
           kill $PID 2>/dev/null || true
